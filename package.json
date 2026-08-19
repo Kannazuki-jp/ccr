@@ -1,0 +1,26 @@
+{
+  "name": "command-control-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-test-coverage --import=tsx 'tests/**/*.test.ts'",
+    "test:plain": "node --test --import=tsx 'tests/**/*.test.ts'",
+    "start": "node --import=tsx src/cli/main.ts",
+    "check": "corepack pnpm run typecheck && corepack pnpm run test && corepack pnpm run build"
+  },
+  "dependencies": {
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
