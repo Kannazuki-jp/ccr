@@ -1,3 +1,7 @@
+/**
+ * @file C2 の入力、提案、永続化エンティティを検証する Zod スキーマと型を定義します。
+ */
+
 import { z } from "zod";
 
 const MAX_TEXT_LENGTH = 10_000;
@@ -50,6 +54,20 @@ export const CommandersIntentSchema = z
     endState: UniqueTextListSchema.min(1),
     priorities: UniqueTextListSchema.min(1),
     constraints: UniqueTextListSchema,
+    /** Deterministic numeric ceilings carried by Commander's Intent. */
+    riskLimits: z
+      .array(
+        z
+          .object({
+            dimension: NonEmptyTextSchema,
+            operator: z.enum(["lt", "lte", "eq"]),
+            value: z.number().finite(),
+          })
+          .strict(),
+      )
+      .optional(),
+    /** Mission-level measurements supplied with decisions owned by the Lead. */
+    risk: z.record(z.string(), z.number().finite()).optional(),
   })
   .strict();
 
@@ -147,6 +165,8 @@ export const TaskProposalSchema = z
     purpose: NonEmptyTextSchema.optional(),
     successCriteria: UniqueTextListSchema.min(1),
     constraints: UniqueTextListSchema.default([]),
+    /** Measurements used by deterministic Mission risk-limit checks. */
+    risk: z.record(z.string(), z.number().finite()).optional(),
     authority: AuthoritySchema.default({
       allowed: [],
       prohibited: [],
@@ -242,6 +262,7 @@ export const TaskSchema = z
     purpose: NonEmptyTextSchema.optional(),
     successCriteria: UniqueTextListSchema.min(1),
     constraints: UniqueTextListSchema,
+    risk: z.record(z.string(), z.number().finite()).optional(),
     authority: AuthoritySchema,
     assignedAgentId: NonEmptyTextSchema.optional(),
     dependencies: z.array(IdentifierSchema),
@@ -472,6 +493,7 @@ export const WorkerContextSchema = z
     relevantContext: JsonValueSchema,
     authority: AuthoritySchema,
     constraints: UniqueTextListSchema,
+    risk: z.record(z.string(), z.number().finite()).optional(),
     attempt: z.number().int().positive(),
   })
   .strict();

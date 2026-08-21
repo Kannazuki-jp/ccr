@@ -1,3 +1,7 @@
+/**
+ * @file C2 ランタイムで各役割のエージェントが満たす共通インターフェースを定義します。
+ */
+
 import type {
   EvaluationProposal,
   Goal,

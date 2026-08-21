@@ -1,8 +1,16 @@
 {
   "name": "command-control-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "packageManager": "pnpm@10.30.3",
   "engines": {
     "node": ">=24"

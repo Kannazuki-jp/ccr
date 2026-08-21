@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+/**
+ * @file Mission の実行と永続化済み状態の参照を行うコマンドラインインターフェースです。
+ */
+
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -197,7 +201,7 @@ function printResult(result: MissionRunResult, json: boolean): void {
 }
 
 function printUsage(): void {
-  process.stdout.write(`Command & Control Runtime v0.1
+  process.stdout.write(`Command & Control Runtime v0.2
 
 Usage:
   corepack pnpm start -- run mission "<goal>" [--db <path>] [--scenario <name>] [--json]

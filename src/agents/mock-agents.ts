@@ -1,3 +1,7 @@
+/**
+ * @file C2 の正常系や再試行などを決定論的に再現するモックエージェントを提供します。
+ */
+
 import type {
   EvaluationProposal,
   Goal,
@@ -56,7 +60,7 @@ export interface MockCallTraceEntry {
   readonly entityId: string;
 }
 
-/** Shared deterministic trace for proving cross-role routing in integration tests. */
+/** 統合テストで役割をまたぐ呼び出し経路を検証するための、決定論的な共有トレースです。 */
 export class MockCallTrace {
   readonly #entries: MockCallTraceEntry[] = [];
 
@@ -97,7 +101,13 @@ export const DEFAULT_TASK_PLAN: TaskPlan = [
     successCriteria: ["Relevant current behavior and constraints are identified"],
     constraints: ["Do not change unrelated behavior"],
     authority: {
-      allowed: ["read project files"],
+      allowed: [
+        "execution.method.select",
+        "execution.tool.select",
+        "code.read",
+        "report.submit",
+        "execution.retry",
+      ],
       prohibited: ["change external systems"],
       requiresApproval: [],
     },
@@ -110,7 +120,13 @@ export const DEFAULT_TASK_PLAN: TaskPlan = [
     successCriteria: ["The requested behavior is implemented"],
     constraints: ["Preserve the stated constraints"],
     authority: {
-      allowed: ["edit in-scope project files"],
+      allowed: [
+        "execution.method.select",
+        "execution.tool.select",
+        "code.edit",
+        "report.submit",
+        "execution.retry",
+      ],
       prohibited: ["change external systems"],
       requiresApproval: [],
     },
@@ -123,7 +139,13 @@ export const DEFAULT_TASK_PLAN: TaskPlan = [
     successCriteria: ["All applicable automated checks pass"],
     constraints: ["Do not hide failed checks"],
     authority: {
-      allowed: ["run project checks"],
+      allowed: [
+        "execution.method.select",
+        "execution.tool.select",
+        "test.run",
+        "report.submit",
+        "execution.retry",
+      ],
       prohibited: ["weaken success criteria"],
       requiresApproval: [],
     },
@@ -139,7 +161,14 @@ export const DEFAULT_REPLAN_TASK_PLAN: TaskPlan = [
     successCriteria: ["The failed criterion is satisfied by the corrective work"],
     constraints: ["Preserve the Commander's Intent and Mission constraints"],
     authority: {
-      allowed: ["edit in-scope project files", "run project checks"],
+      allowed: [
+        "execution.method.select",
+        "execution.tool.select",
+        "code.edit",
+        "test.run",
+        "report.submit",
+        "execution.retry",
+      ],
       prohibited: ["change mission purpose", "weaken success criteria"],
       requiresApproval: [],
     },
@@ -561,11 +590,10 @@ function scenarioEvaluatorHandler(
 }
 
 /**
- * Builds four interface-compatible deterministic agents.
+ * 各インターフェースに適合する4種類の決定論的エージェントを構築します。
  *
- * Scenario defaults are used only when a Worker/Evaluator response or handler is
- * not supplied explicitly. Custom handlers therefore remain the final authority
- * for a test fixture.
+ * シナリオの既定値は Worker または Evaluator の応答やハンドラーが明示されていない場合にのみ使われます。
+ * そのため、テストフィクスチャではカスタムハンドラーが常に最終的な動作を決定します。
  */
 export function createMockAgents(options: MockAgentsOptions = {}): MockAgents {
   const scenario = options.scenario ?? "happy";

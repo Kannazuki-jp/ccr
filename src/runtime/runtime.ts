@@ -1,9 +1,14 @@
+/**
+ * @file Mission の計画、実行、評価、再計画を統制する C2 オーケストレーターを実装します。
+ */
+
 import { randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 
 import type { RuntimeAgents } from "../agents/interfaces.js";
 import {
   AgentRecordSchema,
+  DecisionRequestSchema,
   DecisionSchema,
   EvaluationProposalSchema,
   EvaluatorInputSchema,
@@ -23,22 +28,48 @@ import {
   type AgentImplementation,
   type AgentRecord,
   type AgentRole,
+  type AuthorizationResult,
+  type AuthorityContext,
   type Decision,
+  type DecisionRequest,
+  type DecisionRequestContext,
+  type DecisionType,
+  type DelegationRequest,
+  type DelegationResult,
   type Event,
+  type EscalationRequest,
+  type EscalationResolutionRequest,
+  type EscalationResolutionResult,
+  type EscalationResult,
   type EvaluationProposal,
+  type EffectiveAuthority,
   type JsonValue,
+  type Constraint,
   type Mission,
+  type MissionStatus,
   type MissionRunInput,
   type Report,
   type ReplanContext,
+  type ResourceScope,
+  type Permission,
+  type RoleAuthority,
+  type RevocationRequest,
+  type RevocationResult,
   type Task,
   type TaskPlan,
   type TaskResult,
+  type TaskStatus,
 } from "../domain/index.js";
 import type {
   MissionSnapshot,
   SqliteStore,
 } from "../storage/sqlite/sqlite-store.js";
+import { DoctrineEnforcer } from "./doctrine/enforcer.js";
+import type { DoctrineEnforcerOptions } from "./doctrine/enforcer.js";
+import {
+  issueRuntimeTransitionPermit,
+  issueTaskAssignmentPermit,
+} from "./transition-permit.js";
 
 export interface RuntimeOptions {
   readonly maxRetries?: number;
@@ -48,6 +79,23 @@ export interface RuntimeOptions {
   readonly agentImplementations?: Partial<
     Record<AgentRole, AgentImplementation>
   >;
+  /** Configure role maxima; enforcement itself is not replaceable. */
+  readonly doctrine?: Pick<DoctrineEnforcerOptions, "roleAuthorities">;
+}
+
+/** The narrow Doctrine contract consumed by the C2 orchestration layer. */
+export interface RuntimeDoctrineEnforcer {
+  authorize(request: DecisionRequest): Promise<AuthorizationResult>;
+  delegate(request: DelegationRequest): Promise<DelegationResult>;
+  revoke(request: RevocationRequest): Promise<RevocationResult>;
+  escalate(request: EscalationRequest): Promise<EscalationResult>;
+  resolveEscalation(
+    request: EscalationResolutionRequest,
+  ): Promise<EscalationResolutionResult>;
+  resolveEffectiveAuthority(
+    actorId: string,
+    context: AuthorityContext,
+  ): Promise<EffectiveAuthority>;
 }
 
 export interface MissionRunResult {
@@ -72,9 +120,32 @@ export class RuntimeLimitError extends Error {
   }
 }
 
+export class RuntimeAuthorizationError extends Error {
+  public constructor(
+    public readonly authorization: Exclude<
+      AuthorizationResult,
+      { result: "allow" }
+    >,
+  ) {
+    super(authorization.reason);
+    this.name = "RuntimeAuthorizationError";
+  }
+}
+
+interface RuntimeDecisionInput {
+  readonly actorId: string;
+  readonly role: DecisionRequest["role"];
+  readonly missionId: string;
+  readonly taskId?: string;
+  readonly decisionType: DecisionType;
+  readonly action?: string;
+  readonly resource?: ResourceScope;
+  readonly context?: DecisionRequestContext;
+}
+
 /**
- * The authoritative C2 orchestrator. Agents can propose decisions, but only this
- * class asks the store to perform validated state transitions.
+ * C2 の状態を一元管理する正式なオーケストレーターです。
+ * エージェントは判断を提案できますが、検証済みの状態遷移をストアへ要求できるのはこのクラスだけです。
  */
 export class CommandControlRuntime {
   private readonly maxRetries: number;
@@ -84,6 +155,7 @@ export class CommandControlRuntime {
   private readonly agentImplementations: Partial<
     Record<AgentRole, AgentImplementation>
   >;
+  private readonly doctrineEnforcer: RuntimeDoctrineEnforcer;
 
   public constructor(
     private readonly store: SqliteStore,
@@ -101,27 +173,120 @@ export class CommandControlRuntime {
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? randomUUID;
     this.agentImplementations = options.agentImplementations ?? {};
+    const configuredRoleAuthorities = options.doctrine?.roleAuthorities;
+    this.doctrineEnforcer = new DoctrineEnforcer(store, {
+      ...(configuredRoleAuthorities === undefined
+        ? {}
+        : {
+            roleAuthorities: protectedRuntimeRoleAuthorities(
+              configuredRoleAuthorities,
+            ),
+          }),
+      now: this.now,
+      createId: this.createId,
+    });
+  }
+
+  /** Submit a decision without granting the caller direct access to state mutation. */
+  public authorizeDecision(
+    request: DecisionRequest,
+  ): Promise<AuthorizationResult> {
+    if (request.role === "runtime" || request.actorId === "runtime") {
+      return Promise.resolve({
+        result: "deny",
+        reason: "Runtime state transitions are available only to the internal orchestration path",
+        violation: {
+          code: "COMMAND_BOUNDARY_VIOLATION",
+          actorId: request.actorId,
+          decisionType: request.decisionType,
+          message: "Public callers cannot exercise Runtime state-transition authority",
+          createdAt: this.now(),
+        },
+      });
+    }
+    return this.requireDoctrineEnforcer().authorize(request);
+  }
+
+  /** Submit an explicit authority delegation through the Runtime boundary. */
+  public delegateAuthority(
+    request: DelegationRequest,
+  ): Promise<DelegationResult> {
+    return this.requireDoctrineEnforcer().delegate(request);
+  }
+
+  /** Revoke a previously issued authority grant through the Runtime boundary. */
+  public revokeAuthority(
+    request: RevocationRequest,
+  ): Promise<RevocationResult> {
+    return this.requireDoctrineEnforcer().revoke(request);
+  }
+
+  /** Persist and route an explicit escalation without mutating command-owned state. */
+  public escalateDecision(
+    request: EscalationRequest,
+  ): Promise<EscalationResult> {
+    return this.requireDoctrineEnforcer().escalate(request);
+  }
+
+  /** Resolve an open escalation only through its recorded target owner. */
+  public resolveEscalation(
+    request: EscalationResolutionRequest,
+  ): Promise<EscalationResolutionResult> {
+    return this.requireDoctrineEnforcer().resolveEscalation(request);
+  }
+
+  /** Inspect the current intersection of role, grants, constraints, and risk limits. */
+  public resolveEffectiveAuthority(
+    actorId: string,
+    context: AuthorityContext,
+  ): Promise<EffectiveAuthority> {
+    return this.requireDoctrineEnforcer().resolveEffectiveAuthority(
+      actorId,
+      context,
+    );
   }
 
   public async run(input: MissionRunInput): Promise<MissionRunResult> {
     const parsedInput = MissionRunInputSchema.parse(input);
     const createdAt = this.now();
+    const missionId = this.createId();
     const goal = GoalSchema.parse({
       id: this.createId(),
       description: parsedInput.goal,
       createdAt,
     });
 
+    await this.requireAuthorized({
+      actorId: "human",
+      role: "human",
+      missionId,
+      decisionType: "goal.create",
+      context: { goalId: goal.id },
+    });
+
     this.registerAgents(createdAt);
 
-    // Parse the proposal before a Mission exists. Agent-provided IDs, statuses,
-    // timestamps, or other control fields are rejected by the strict schema.
+    // Parse the proposal before authorization or persistence. Agent-provided
+    // IDs, statuses, timestamps, or other control fields are rejected by the
+    // strict schema, while its measured risk becomes authorization context.
     const missionProposal = MissionProposalSchema.parse(
       await this.agents.commander.createMission(structuredClone(goal)),
     );
+    await this.requireAuthorized({
+      actorId: this.agents.commander.id,
+      role: "commander",
+      missionId,
+      decisionType: "mission.create",
+      context: {
+        goalId: goal.id,
+        ...(missionProposal.intent.risk === undefined
+          ? {}
+          : { risk: missionProposal.intent.risk }),
+      },
+    });
 
     let mission = MissionSchema.parse({
-      id: this.createId(),
+      id: missionId,
       goal: goal.description,
       intent: missionProposal.intent,
       successCriteria: missionProposal.successCriteria,
@@ -136,8 +301,9 @@ export class CommandControlRuntime {
         goal: goal.description,
       }),
     );
+    await this.delegateMissionAuthorityToLead(mission);
 
-    mission = this.store.transitionMission(
+    mission = await this.transitionMission(
       mission.id,
       "planning",
       this.makeEvent(
@@ -151,10 +317,18 @@ export class CommandControlRuntime {
     let initialPlan: TaskPlan;
     try {
       const leadInput = LeadPlanInputSchema.parse({ mission });
+      await this.requireAuthorized({
+        actorId: this.agents.lead.id,
+        role: "lead",
+        missionId: mission.id,
+        decisionType: "plan.modify",
+        context: this.leadDecisionContext(mission, { phase: "initial" }),
+      });
       initialPlan = TaskPlanSchema.parse(
         await this.agents.lead.plan(structuredClone(leadInput.mission)),
       );
     } catch (error) {
+      if (error instanceof RuntimeAuthorizationError) throw error;
       return this.failFromAgentBoundary(
         mission,
         "lead",
@@ -167,9 +341,9 @@ export class CommandControlRuntime {
         taskCount: initialPlan.length,
       }),
     );
-    this.persistPlan(mission, initialPlan);
+    await this.persistPlan(mission, initialPlan);
 
-    mission = this.store.transitionMission(
+    mission = await this.transitionMission(
       mission.id,
       "executing",
       this.makeEvent(mission.id, "MissionExecutionStarted", "runtime", {
@@ -180,7 +354,7 @@ export class CommandControlRuntime {
     return this.executeMission(mission, 0);
   }
 
-  /** Read durable state without invoking an Agent or appending an Event. */
+  /** エージェントの呼び出しやイベントの追加を行わず、永続化済みの状態を読み取ります。 */
   public observeMission(missionId: string): MissionRunResult | undefined {
     const snapshot = this.store.loadMissionSnapshot(missionId);
     return snapshot === undefined ? undefined : this.toRunResult(snapshot);
@@ -211,7 +385,7 @@ export class CommandControlRuntime {
               `Mission ${mission.id} exhausted work from unexpected state ${mission.status}`,
             );
           }
-          mission = this.store.transitionMission(
+          mission = await this.transitionMission(
             mission.id,
             "completed",
             this.makeEvent(mission.id, "MissionCompleted", "runtime", {
@@ -223,7 +397,7 @@ export class CommandControlRuntime {
           return this.toRunResult(this.requireSnapshot(mission.id));
         }
 
-        mission = this.store.transitionMission(
+        mission = await this.transitionMission(
           mission.id,
           "blocked",
           this.makeEvent(mission.id, "MissionBlocked", "runtime", {
@@ -234,7 +408,7 @@ export class CommandControlRuntime {
         return this.toRunResult(this.requireSnapshot(mission.id));
       }
 
-      let task = this.assignAndStartTask(mission, runnable);
+      let task = await this.assignAndStartTask(mission, runnable);
       const context = WorkerContextSchema.parse({
         mission: {
           id: mission.id,
@@ -248,6 +422,7 @@ export class CommandControlRuntime {
         ),
         authority: task.authority,
         constraints: task.constraints,
+        ...(task.risk === undefined ? {} : { risk: task.risk }),
         attempt: task.attempts,
       });
 
@@ -256,6 +431,31 @@ export class CommandControlRuntime {
       let result: TaskResult;
       try {
         const workerInput = WorkerExecutionInputSchema.parse({ task, context });
+        const executionActions = task.authority.allowed.filter(
+          (action) =>
+            isCanonicalDoctrineTarget(action) &&
+            action !== "report.submit" &&
+            action !== "execution.retry",
+        );
+        if (executionActions.length === 0) {
+          throw new Error(
+            `Task ${task.id} has no canonical Worker execution permission`,
+          );
+        }
+        for (const action of executionActions) {
+          await this.requireAuthorized({
+            actorId: this.agents.worker.id,
+            role: "worker",
+            missionId: mission.id,
+            taskId: task.id,
+            decisionType: workerDecisionType(action),
+            action,
+            resource: { type: "task", taskId: task.id },
+            context: this.workerDecisionContext(task, {
+              attempt: task.attempts,
+            }),
+          });
+        }
         result = TaskResultSchema.parse(
           await this.agents.worker.execute(
             structuredClone(workerInput.task),
@@ -263,6 +463,7 @@ export class CommandControlRuntime {
           ),
         );
       } catch (error) {
+        if (error instanceof RuntimeAuthorizationError) throw error;
         return this.failFromAgentBoundary(
           mission,
           "worker",
@@ -271,10 +472,30 @@ export class CommandControlRuntime {
           task,
         );
       }
+      await this.requireAuthorized({
+        actorId: this.agents.worker.id,
+        role: "worker",
+        missionId: mission.id,
+        taskId: task.id,
+        decisionType: "report.submit",
+        resource: { type: "task", taskId: task.id },
+        context: this.workerDecisionContext(task, {
+          attempt: task.attempts,
+          status: result.report.status,
+        }),
+      });
       const report = this.persistReport(mission, task, result);
 
       if (requiresEscalation(result)) {
-        task = this.store.transitionTask(
+        const boundary = await this.requestBoundaryEscalation({
+          actorId: this.agents.worker.id,
+          role: "worker",
+          missionId: mission.id,
+          taskId: task.id,
+          decisionType: "mission.scope.modify",
+          reason: escalationReason(result),
+        });
+        task = await this.transitionTask(
           task.id,
           "blocked",
           this.makeEvent(mission.id, "TaskBlocked", this.agents.worker.id, {
@@ -290,7 +511,7 @@ export class CommandControlRuntime {
           [escalationReason(result)],
           this.agents.worker.id,
         );
-        mission = this.store.transitionMission(
+        mission = await this.transitionMission(
           mission.id,
           "escalated",
           this.makeEvent(
@@ -301,14 +522,15 @@ export class CommandControlRuntime {
               taskId: task.id,
               reportId: report.id,
               reason: escalationReason(result),
-              target: "commander-or-human",
+              target: boundary.escalation.targetRole,
+              escalationId: boundary.escalation.id,
             },
           ),
         );
         return this.toRunResult(this.requireSnapshot(mission.id));
       }
 
-      task = this.store.transitionTask(
+      task = await this.transitionTask(
         task.id,
         "evaluating",
         this.makeEvent(mission.id, "TaskEvaluationStarted", "runtime", {
@@ -316,7 +538,7 @@ export class CommandControlRuntime {
           reportId: report.id,
         }),
       );
-      mission = this.store.transitionMission(
+      mission = await this.transitionMission(
         mission.id,
         "evaluating",
         this.makeEvent(mission.id, "MissionEvaluationStarted", "runtime", {
@@ -328,6 +550,14 @@ export class CommandControlRuntime {
       let evaluation: EvaluationProposal;
       try {
         const evaluatorInput = EvaluatorInputSchema.parse({ task, result });
+        await this.requireAuthorized({
+          actorId: this.agents.evaluator.id,
+          role: "evaluator",
+          missionId: mission.id,
+          taskId: task.id,
+          decisionType: "evaluation.verify",
+          context: { reportId: report.id, attempt: task.attempts },
+        });
         evaluation = EvaluationProposalSchema.parse(
           await this.agents.evaluator.evaluate(
             structuredClone(evaluatorInput.task),
@@ -335,6 +565,7 @@ export class CommandControlRuntime {
           ),
         );
       } catch (error) {
+        if (error instanceof RuntimeAuthorizationError) throw error;
         return this.failFromAgentBoundary(
           mission,
           "evaluator",
@@ -342,6 +573,28 @@ export class CommandControlRuntime {
           error,
           task,
         );
+      }
+      await this.requireAuthorized({
+        actorId: this.agents.evaluator.id,
+        role: "evaluator",
+        missionId: mission.id,
+        taskId: task.id,
+        decisionType:
+          evaluation.result === "pass" ? "evaluation.pass" : "evaluation.fail",
+        context: {
+          reportId: report.id,
+          recommendation: evaluation.recommendation,
+        },
+      });
+      if (evaluation.result === "fail") {
+        await this.requireAuthorized({
+          actorId: this.agents.evaluator.id,
+          role: "evaluator",
+          missionId: mission.id,
+          taskId: task.id,
+          decisionType: "evaluation.recommend",
+          context: { recommendation: evaluation.recommendation },
+        });
       }
       this.store.appendEvent(
         this.makeEvent(
@@ -361,19 +614,20 @@ export class CommandControlRuntime {
       );
 
       if (evaluation.result === "pass") {
-        task = this.store.transitionTask(
+        task = await this.transitionTask(
           task.id,
           "completed",
           this.makeEvent(mission.id, "TaskCompleted", "runtime", {
             taskId: task.id,
             reportId: report.id,
           }),
+          { reportId: report.id, evaluation: "pass" },
         );
         const hasPending = this.requireSnapshot(mission.id).tasks.some(
           (candidate) => candidate.status === "pending",
         );
         if (hasPending) {
-          mission = this.store.transitionMission(
+          mission = await this.transitionMission(
             mission.id,
             "executing",
             this.makeEvent(
@@ -400,13 +654,24 @@ export class CommandControlRuntime {
       switch (evaluation.recommendation) {
         case "retry": {
           if (task.attempts > this.maxRetries) {
-            return this.failMissionAfterLimit(
+            return await this.failMissionAfterLimit(
               mission,
               task,
               `Retry limit exhausted after ${task.attempts} attempt(s)`,
             );
           }
-          task = this.store.transitionTask(
+          await this.requireAuthorized({
+            actorId: this.agents.worker.id,
+            role: "worker",
+            missionId: mission.id,
+            taskId: task.id,
+            decisionType: "execution.retry",
+            resource: { type: "task", taskId: task.id },
+            context: this.workerDecisionContext(task, {
+              nextAttempt: task.attempts + 1,
+            }),
+          });
+          task = await this.transitionTask(
             task.id,
             "pending",
             this.makeEvent(mission.id, "TaskRetryScheduled", "runtime", {
@@ -415,7 +680,7 @@ export class CommandControlRuntime {
               nextAttempt: task.attempts + 1,
             }),
           );
-          mission = this.store.transitionMission(
+          mission = await this.transitionMission(
             mission.id,
             "executing",
             this.makeEvent(mission.id, "MissionExecutionResumed", "runtime", {
@@ -427,13 +692,13 @@ export class CommandControlRuntime {
         }
         case "replan": {
           if (replanCount >= this.maxReplans) {
-            return this.failMissionAfterLimit(
+            return await this.failMissionAfterLimit(
               mission,
               task,
               `Replan limit exhausted after ${replanCount} replan(s)`,
             );
           }
-          task = this.store.transitionTask(
+          task = await this.transitionTask(
             task.id,
             "failed",
             this.makeEvent(mission.id, "TaskFailed", "runtime", {
@@ -443,7 +708,7 @@ export class CommandControlRuntime {
               supersededByReplan: true,
             }),
           );
-          mission = this.store.transitionMission(
+          mission = await this.transitionMission(
             mission.id,
             "replanning",
             this.makeEvent(mission.id, "MissionReplanningStarted", "runtime", {
@@ -464,6 +729,17 @@ export class CommandControlRuntime {
               mission,
               context: replanContext,
             });
+            await this.requireAuthorized({
+              actorId: this.agents.lead.id,
+              role: "lead",
+              missionId: mission.id,
+              taskId: task.id,
+              decisionType: "plan.modify",
+              context: this.leadDecisionContext(mission, {
+                phase: "replan",
+                replanCount: replanCount + 1,
+              }),
+            });
             replacementPlan = TaskPlanSchema.parse(
               await this.agents.lead.replan(
                 structuredClone(leadInput.mission),
@@ -471,6 +747,7 @@ export class CommandControlRuntime {
               ),
             );
           } catch (error) {
+            if (error instanceof RuntimeAuthorizationError) throw error;
             return this.failFromAgentBoundary(
               mission,
               "lead",
@@ -498,7 +775,18 @@ export class CommandControlRuntime {
           for (const superseded of this.store
             .listTasks(mission.id)
             .filter((candidate) => candidate.status === "pending")) {
-            this.store.transitionTask(
+            await this.requireAuthorized({
+              actorId: this.agents.lead.id,
+              role: "lead",
+              missionId: mission.id,
+              taskId: superseded.id,
+              decisionType: "task.remove",
+              context: this.leadDecisionContext(mission, {
+                reason: "superseded-by-replan",
+                failedTaskId: task.id,
+              }),
+            });
+            await this.transitionTask(
               superseded.id,
               "cancelled",
               this.makeEvent(
@@ -513,8 +801,8 @@ export class CommandControlRuntime {
               ),
             );
           }
-          this.persistPlan(mission, replacementPlan);
-          mission = this.store.transitionMission(
+          await this.persistPlan(mission, replacementPlan);
+          mission = await this.transitionMission(
             mission.id,
             "executing",
             this.makeEvent(mission.id, "MissionExecutionResumed", "runtime", {
@@ -525,7 +813,20 @@ export class CommandControlRuntime {
           continue;
         }
         case "escalate": {
-          task = this.store.transitionTask(
+          const escalation = await this.doctrineEnforcer.escalate({
+            id: this.createId(),
+            missionId: mission.id,
+            taskId: task.id,
+            requesterId: this.agents.evaluator.id,
+            decisionType: "mission.scope.modify",
+            reason: evaluation.reasons.join("; "),
+            targetRole: "commander",
+            createdAt: this.now(),
+          });
+          if (escalation.result !== "escalate") {
+            throw new RuntimeAuthorizationError(escalation);
+          }
+          task = await this.transitionTask(
             task.id,
             "blocked",
             this.makeEvent(mission.id, "TaskBlocked", "runtime", {
@@ -534,7 +835,7 @@ export class CommandControlRuntime {
               reasons: evaluation.reasons,
             }),
           );
-          mission = this.store.transitionMission(
+          mission = await this.transitionMission(
             mission.id,
             "escalated",
             this.makeEvent(
@@ -545,14 +846,15 @@ export class CommandControlRuntime {
                 taskId: task.id,
                 decisionId: decision.id,
                 reasons: evaluation.reasons,
-                target: "commander-or-human",
+                target: escalation.escalation.targetRole,
+                escalationId: escalation.escalation.id,
               },
             ),
           );
           return this.toRunResult(this.requireSnapshot(mission.id));
         }
         case "fail":
-          task = this.store.transitionTask(
+          task = await this.transitionTask(
             task.id,
             "failed",
             this.makeEvent(mission.id, "TaskFailed", "runtime", {
@@ -561,12 +863,12 @@ export class CommandControlRuntime {
               reasons: evaluation.reasons,
             }),
           );
-          this.cancelPendingTasks(
+          await this.cancelPendingTasks(
             mission.id,
             "Mission failed after an unrecoverable evaluation",
             task.id,
           );
-          mission = this.store.transitionMission(
+          mission = await this.transitionMission(
             mission.id,
             "failed",
             this.makeEvent(mission.id, "MissionFailed", "runtime", {
@@ -583,7 +885,7 @@ export class CommandControlRuntime {
     }
   }
 
-  private persistPlan(mission: Mission, plan: TaskPlan): Task[] {
+  private async persistPlan(mission: Mission, plan: TaskPlan): Promise<Task[]> {
     const idsByKey = new Map(
       plan.map((proposal) => [proposal.key, this.createId()] as const),
     );
@@ -598,6 +900,9 @@ export class CommandControlRuntime {
           : { purpose: proposal.purpose }),
         successCriteria: proposal.successCriteria,
         constraints: proposal.constraints,
+        ...((proposal.risk ?? mission.intent.risk) === undefined
+          ? {}
+          : { risk: proposal.risk ?? mission.intent.risk }),
         authority: proposal.authority,
         dependencies: proposal.dependencies.map((key) => idsByKey.get(key)),
         status: "pending",
@@ -607,6 +912,17 @@ export class CommandControlRuntime {
       }),
     );
     for (const task of tasks) {
+      await this.requireAuthorized({
+        actorId: this.agents.lead.id,
+        role: "lead",
+        missionId: mission.id,
+        taskId: task.id,
+        decisionType: "task.create",
+        context: {
+          objective: task.objective,
+          ...(task.risk === undefined ? {} : { risk: task.risk }),
+        },
+      });
       this.store.saveTaskAndEvent(
         task,
         this.makeEvent(mission.id, "TaskCreated", this.agents.lead.id, {
@@ -619,29 +935,68 @@ export class CommandControlRuntime {
     return tasks;
   }
 
-  private assignAndStartTask(mission: Mission, pending: Task): Task {
-    const assignedAt = this.now();
-    let task = TaskSchema.parse({
-      ...pending,
-      assignedAgentId: this.agents.worker.id,
-      attempts: pending.attempts + 1,
-      updatedAt: assignedAt,
-    });
-    this.store.saveTaskAndEvent(
-      task,
-      this.makeEvent(mission.id, "TaskAssigned", "runtime", {
+  private async assignAndStartTask(
+    mission: Mission,
+    pending: Task,
+  ): Promise<Task> {
+    let task = pending;
+    if (task.assignedAgentId === undefined) {
+      const { request, authorization } = await this.requireAuthorizedRequest({
+        actorId: this.agents.lead.id,
+        role: "lead",
+        missionId: mission.id,
         taskId: task.id,
-        workerAgentId: this.agents.worker.id,
-        attempt: task.attempts,
-      }),
-    );
-    task = this.store.transitionTask(
+        decisionType: "task.assign",
+        context: this.leadDecisionContext(mission, {
+          workerAgentId: this.agents.worker.id,
+        }),
+      });
+      const assignmentEvent = EventSchema.parse({
+        ...this.makeEvent(mission.id, "TaskAssigned", "runtime", {
+          taskId: task.id,
+          workerAgentId: this.agents.worker.id,
+        }),
+        createdAt: this.now(),
+      });
+      task = this.store.assignTaskAndEvent(
+        task.id,
+        this.agents.worker.id,
+        assignmentEvent,
+        issueTaskAssignmentPermit(request, authorization, assignmentEvent),
+      );
+    } else if (task.assignedAgentId !== this.agents.worker.id) {
+      throw new Error(
+        `Task ${task.id} is already assigned to ${task.assignedAgentId}`,
+      );
+    }
+
+    const existingGrant = this.store
+      .listAuthorityGrants(mission.id, this.agents.worker.id)
+      .some(({ taskId, status }) => taskId === task.id && status === "active");
+    if (!existingGrant) {
+      const delegation = await this.doctrineEnforcer.delegate({
+        issuerId: this.agents.lead.id,
+        subjectId: this.agents.worker.id,
+        missionId: mission.id,
+        taskId: task.id,
+        permissions: this.taskPermissions(task),
+        constraints: this.taskConstraints(mission, task),
+        riskLimits: mission.intent.riskLimits ?? [],
+      });
+      if (delegation.result !== "allow") {
+        throw new RuntimeAuthorizationError(delegation);
+      }
+    }
+    task = await this.transitionTask(
       task.id,
       "running",
-      this.makeEvent(mission.id, "TaskStarted", this.agents.worker.id, {
-        taskId: task.id,
-        attempt: task.attempts,
+      this.makeEvent(mission.id, "TaskStarted", "runtime", {
+        taskId: pending.id,
+        workerAgentId: this.agents.worker.id,
+        attempt: pending.attempts + 1,
       }),
+      undefined,
+      task.attempts + 1,
     );
     return task;
   }
@@ -708,11 +1063,11 @@ export class CommandControlRuntime {
     return decision;
   }
 
-  private failMissionAfterLimit(
+  private async failMissionAfterLimit(
     mission: Mission,
     task: Task,
     reason: string,
-  ): MissionRunResult {
+  ): Promise<MissionRunResult> {
     const limitDecision = this.persistDecision(
       mission.id,
       task.id,
@@ -720,7 +1075,7 @@ export class CommandControlRuntime {
       [reason],
       "runtime",
     );
-    this.store.transitionTask(
+    await this.transitionTask(
       task.id,
       "failed",
       this.makeEvent(mission.id, "TaskFailed", "runtime", {
@@ -729,8 +1084,8 @@ export class CommandControlRuntime {
         reason,
       }),
     );
-    this.cancelPendingTasks(mission.id, reason, task.id);
-    this.store.transitionMission(
+    await this.cancelPendingTasks(mission.id, reason, task.id);
+    await this.transitionMission(
       mission.id,
       "failed",
       this.makeEvent(mission.id, "MissionFailed", "runtime", {
@@ -742,13 +1097,13 @@ export class CommandControlRuntime {
     return this.toRunResult(this.requireSnapshot(mission.id));
   }
 
-  private failFromAgentBoundary(
+  private async failFromAgentBoundary(
     mission: Mission,
     role: AgentRole,
     operation: string,
     error: unknown,
     task?: Task,
-  ): MissionRunResult {
+  ): Promise<MissionRunResult> {
     const persistedMission = this.store.getMission(mission.id) ?? mission;
     const persistedTask =
       task === undefined ? undefined : this.store.getTask(task.id) ?? task;
@@ -771,7 +1126,7 @@ export class CommandControlRuntime {
       (persistedTask.status === "running" ||
         persistedTask.status === "evaluating")
     ) {
-      this.store.transitionTask(
+      await this.transitionTask(
         persistedTask.id,
         "failed",
         this.makeEvent(mission.id, "TaskFailed", "runtime", {
@@ -782,12 +1137,12 @@ export class CommandControlRuntime {
         }),
       );
     }
-    this.cancelPendingTasks(
+    await this.cancelPendingTasks(
       mission.id,
       `${failureType} at ${role}.${operation}`,
       persistedTask?.id,
     );
-    this.store.transitionMission(
+    await this.transitionMission(
       mission.id,
       "failed",
       this.makeEvent(mission.id, "MissionFailed", "runtime", {
@@ -800,15 +1155,15 @@ export class CommandControlRuntime {
     return this.toRunResult(this.requireSnapshot(persistedMission.id));
   }
 
-  private cancelPendingTasks(
+  private async cancelPendingTasks(
     missionId: string,
     reason: string,
     relatedTaskId?: string,
-  ): void {
+  ): Promise<void> {
     for (const pending of this.store
       .listTasks(missionId)
       .filter((candidate) => candidate.status === "pending")) {
-      this.store.transitionTask(
+      await this.transitionTask(
         pending.id,
         "cancelled",
         this.makeEvent(missionId, "TaskCancelled", "runtime", {
@@ -858,12 +1213,305 @@ export class CommandControlRuntime {
     });
   }
 
+  private async requireAuthorized(
+    input: RuntimeDecisionInput,
+  ): Promise<AuthorizationResult & { result: "allow" }> {
+    return (await this.requireAuthorizedRequest(input)).authorization;
+  }
+
+  private async requireAuthorizedRequest(
+    input: RuntimeDecisionInput,
+  ): Promise<{
+    request: DecisionRequest;
+    authorization: AuthorizationResult & { result: "allow" };
+  }> {
+    const request = DecisionRequestSchema.parse({
+      id: this.createId(),
+      actorId: input.actorId,
+      role: input.role,
+      missionId: input.missionId,
+      ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
+      decisionType: input.decisionType,
+      action: input.action ?? input.decisionType,
+      ...(input.resource === undefined ? {} : { resource: input.resource }),
+      ...(input.context === undefined ? {} : { context: input.context }),
+      createdAt: this.now(),
+    });
+    const result = await this.doctrineEnforcer.authorize(request);
+    if (result.result !== "allow") {
+      throw new RuntimeAuthorizationError(result);
+    }
+    return { request, authorization: result };
+  }
+
+  private async requestBoundaryEscalation(
+    input: RuntimeDecisionInput & { readonly reason: string },
+  ): Promise<AuthorizationResult & { result: "escalate" }> {
+    const request = DecisionRequestSchema.parse({
+      id: this.createId(),
+      actorId: input.actorId,
+      role: input.role,
+      missionId: input.missionId,
+      ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
+      decisionType: input.decisionType,
+      action: input.action ?? input.decisionType,
+      ...(input.resource === undefined ? {} : { resource: input.resource }),
+      context: {
+        ...(input.context ?? {}),
+        intent: "request_change",
+        requestedChange: { reason: input.reason },
+      },
+      createdAt: this.now(),
+    });
+    const result = await this.doctrineEnforcer.authorize(request);
+    if (result.result !== "escalate") {
+      if (result.result === "deny") {
+        throw new RuntimeAuthorizationError(result);
+      }
+      throw new Error(
+        `Expected ${input.decisionType} to cross the ${input.role} boundary`,
+      );
+    }
+    return result;
+  }
+
+  private async transitionMission(
+    missionId: string,
+    nextStatus: MissionStatus,
+    event: Event,
+  ): Promise<Mission> {
+    const current = this.store.getMission(missionId);
+    if (current === undefined) {
+      throw new Error(`Mission not found before transition: ${missionId}`);
+    }
+    const request = DecisionRequestSchema.parse({
+      id: this.createId(),
+      actorId: "runtime",
+      role: "runtime",
+      missionId,
+      decisionType: "state.transition",
+      action: "state.transition",
+      context: {
+        entity: "mission",
+        entityId: missionId,
+        from: current.status,
+        to: nextStatus,
+        eventType: event.type,
+      },
+      createdAt: this.now(),
+    });
+    const authorization = await this.doctrineEnforcer.authorize(request);
+    if (authorization.result !== "allow") {
+      throw new RuntimeAuthorizationError(authorization);
+    }
+    const authorizedEvent = EventSchema.parse({
+      ...event,
+      createdAt: this.now(),
+    });
+    const permit = issueRuntimeTransitionPermit(
+      request,
+      authorization,
+      authorizedEvent,
+    );
+    return this.store.transitionMission(
+      missionId,
+      nextStatus,
+      authorizedEvent,
+      permit,
+    );
+  }
+
+  private async transitionTask(
+    taskId: string,
+    nextStatus: TaskStatus,
+    event: Event,
+    evidence?: { readonly reportId: string; readonly evaluation: "pass" },
+    attempts?: number,
+  ): Promise<Task> {
+    const current = this.store.getTask(taskId);
+    if (current === undefined) {
+      throw new Error(`Task not found before transition: ${taskId}`);
+    }
+    if (nextStatus === "completed" && evidence === undefined) {
+      throw new Error(
+        `Task ${taskId} completion requires persisted evidence and an Evaluator PASS`,
+      );
+    }
+    const request = DecisionRequestSchema.parse({
+      id: this.createId(),
+      actorId: "runtime",
+      role: "runtime",
+      missionId: current.missionId,
+      taskId,
+      decisionType: "state.transition",
+      action: "state.transition",
+      context: {
+        entity: "task",
+        entityId: taskId,
+        from: current.status,
+        to: nextStatus,
+        eventType: event.type,
+        ...(evidence === undefined
+          ? {}
+          : {
+              evaluationResult: evidence.evaluation,
+              reportId: evidence.reportId,
+            }),
+        ...(attempts === undefined ? {} : { attempts }),
+      },
+      createdAt: this.now(),
+    });
+    const authorization = await this.doctrineEnforcer.authorize(request);
+    if (authorization.result !== "allow") {
+      throw new RuntimeAuthorizationError(authorization);
+    }
+    const authorizedEvent = EventSchema.parse({
+      ...event,
+      createdAt: this.now(),
+    });
+    const permit = issueRuntimeTransitionPermit(
+      request,
+      authorization,
+      authorizedEvent,
+    );
+    return this.store.transitionTask(taskId, nextStatus, authorizedEvent, permit);
+  }
+
   private requireSnapshot(missionId: string): MissionSnapshot {
     const snapshot = this.store.loadMissionSnapshot(missionId);
     if (snapshot === undefined) {
       throw new Error(`Mission not found after persistence: ${missionId}`);
     }
     return snapshot;
+  }
+
+  private taskPermissions(task: Task): Permission[] {
+    const scope = { type: "task" as const, taskId: task.id };
+    const actions = new Set(
+      task.authority.allowed.filter(isCanonicalDoctrineTarget),
+    );
+    for (const approvalAction of task.authority.requiresApproval) {
+      if (isCanonicalDoctrineTarget(approvalAction)) actions.add(approvalAction);
+    }
+    return [...actions].map((action) => ({ action, resource: scope }));
+  }
+
+  private async delegateMissionAuthorityToLead(mission: Mission): Promise<void> {
+    const actions = [
+      "task.*",
+      "plan.modify",
+      "authority.delegate",
+      "execution.*",
+      "report.submit",
+      "code.*",
+      "public_api.modify",
+      "test.run",
+      "tool.select",
+    ];
+    const result = await this.doctrineEnforcer.delegate({
+      issuerId: this.agents.commander.id,
+      subjectId: this.agents.lead.id,
+      missionId: mission.id,
+      permissions: actions.map((action) => ({
+        action,
+        resource: { type: "global" as const },
+      })),
+      constraints: [],
+      riskLimits: [],
+    });
+    if (result.result !== "allow") throw new RuntimeAuthorizationError(result);
+    const constraints = this.missionConstraints(mission);
+    const riskLimits = mission.intent.riskLimits ?? [];
+    if (constraints.length > 0 || riskLimits.length > 0) {
+      const narrowing = await this.doctrineEnforcer.delegate({
+        issuerId: this.agents.commander.id,
+        subjectId: this.agents.lead.id,
+        missionId: mission.id,
+        permissions: [],
+        constraints,
+        riskLimits,
+      });
+      if (narrowing.result !== "allow") {
+        throw new RuntimeAuthorizationError(narrowing);
+      }
+    }
+  }
+
+  private missionConstraints(mission: Mission): Constraint[] {
+    const constraints: Constraint[] = [];
+    mission.intent.constraints.forEach((raw, index) => {
+      const parsed = parseConstraint(raw, undefined);
+      if (parsed === undefined) return;
+      constraints.push({
+        id: `${this.agents.commander.id}:${mission.id}:constraint:${index}`,
+        sourceId: this.agents.commander.id,
+        ...parsed,
+        inherited: true,
+      });
+    });
+    return constraints;
+  }
+
+  private taskConstraints(mission: Mission, task: Task): Constraint[] {
+    const scope = { type: "task" as const, taskId: task.id };
+    const constraints: Constraint[] = [];
+    const add = (
+      sourceId: string,
+      raw: string,
+      fallbackKind: Constraint["kind"] | undefined,
+      inherited: boolean,
+      index: number,
+    ): void => {
+      const parsed = parseConstraint(raw, fallbackKind);
+      if (parsed === undefined) return;
+      constraints.push({
+        id: `${sourceId}:${task.id}:constraint:${index}:${constraints.length}`,
+        sourceId,
+        ...parsed,
+        scope,
+        inherited,
+      });
+    };
+
+    task.constraints.forEach((value, index) =>
+      add(this.agents.lead.id, value, undefined, true, index));
+    task.authority.prohibited.forEach((value, index) =>
+      add(this.agents.lead.id, value, "prohibit", true, index));
+    task.authority.requiresApproval.forEach((value, index) => {
+      if (!isCanonicalDoctrineTarget(value)) return;
+      constraints.push({
+        id: `${this.agents.lead.id}:${task.id}:approval:${index}`,
+        sourceId: this.agents.lead.id,
+        kind: "require",
+        target: "runtime.approval",
+        scope,
+        value,
+        inherited: true,
+      });
+    });
+    return constraints;
+  }
+
+  private workerDecisionContext(
+    task: Task,
+    context: DecisionRequestContext,
+  ): DecisionRequestContext {
+    return task.risk === undefined
+      ? context
+      : { ...context, risk: task.risk };
+  }
+
+  private leadDecisionContext(
+    mission: Mission,
+    context: DecisionRequestContext,
+  ): DecisionRequestContext {
+    return mission.intent.risk === undefined
+      ? context
+      : { ...context, risk: mission.intent.risk };
+  }
+
+  private requireDoctrineEnforcer(): RuntimeDoctrineEnforcer {
+    return this.doctrineEnforcer;
   }
 
   private toRunResult(snapshot: MissionSnapshot): MissionRunResult {
@@ -925,6 +1573,79 @@ export class CommandControlRuntime {
       ...(finalResult === undefined ? {} : { finalResult }),
     };
   }
+}
+
+function isCanonicalDoctrineTarget(value: string): boolean {
+  return /^(?:\*|[a-z][a-z0-9_-]*(?:\.(?:\*|[a-z][a-z0-9_-]*))*)$/.test(
+    value,
+  );
+}
+
+function parseConstraint(
+  raw: string,
+  fallbackKind: Constraint["kind"] | undefined,
+): Pick<Constraint, "kind" | "target" | "value"> | undefined {
+  const explicit = /^(prohibit|require):(.+)$/.exec(raw);
+  if (explicit !== null) {
+    const target = explicit[2]!.trim();
+    if (!isCanonicalDoctrineTarget(target)) return undefined;
+    return {
+      kind: explicit[1] as "prohibit" | "require",
+      target,
+    };
+  }
+  const limit = /^limit:([^<]+)<=(-?(?:\d+(?:\.\d+)?|\.\d+))$/.exec(raw);
+  if (limit !== null) {
+    const target = limit[1]!.trim();
+    if (!isCanonicalDoctrineTarget(target)) return undefined;
+    return { kind: "limit", target, value: Number(limit[2]) };
+  }
+  return fallbackKind !== undefined && isCanonicalDoctrineTarget(raw)
+    ? { kind: fallbackKind, target: raw }
+    : undefined;
+}
+
+function workerDecisionType(action: string): DecisionType {
+  if (action === "execution.method.select") return action;
+  if (action === "execution.tool.select" || action === "tool.select") {
+    return "execution.tool.select";
+  }
+  if (action === "execution.retry") return action;
+  if (action === "execution.procedure.modify" || action === "test.run") {
+    return "execution.procedure.modify";
+  }
+  return "execution.local_change";
+}
+
+function protectedRuntimeRoleAuthorities(
+  configured: readonly RoleAuthority[],
+): readonly RoleAuthority[] {
+  return [
+    ...configured.filter(
+      ({ subjectId, role }) =>
+        subjectId !== "human" &&
+        subjectId !== "runtime" &&
+        role !== "human" &&
+        role !== "runtime",
+    ),
+    {
+      subjectId: "human",
+      role: "human",
+      permissions: [{ action: "*", resource: { type: "global" } }],
+      constraints: [],
+      riskLimits: [],
+    },
+    {
+      subjectId: "runtime",
+      role: "runtime",
+      permissions: [
+        { action: "state.transition", resource: { type: "global" } },
+        { action: "authority.revoke", resource: { type: "global" } },
+      ],
+      constraints: [],
+      riskLimits: [],
+    },
+  ];
 }
 
 function requireNonNegativeInteger(value: number, name: string): number {

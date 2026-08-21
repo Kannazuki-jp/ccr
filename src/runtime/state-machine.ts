@@ -1,3 +1,7 @@
+/**
+ * @file Mission と Task に許可された状態遷移と、その検証関数を定義します。
+ */
+
 import type { MissionStatus, TaskStatus } from "../domain/index.js";
 
 export const missionTransitionMap = {

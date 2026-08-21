@@ -1,3 +1,7 @@
+/**
+ * @file ベンダーに依存しない構造化 LLM リクエストとプロバイダー契約を定義します。
+ */
+
 import { z } from "zod";
 
 import type { AgentRole, JsonValue } from "../domain/index.js";
@@ -22,9 +26,9 @@ export interface StructuredLlmRequest {
 }
 
 /**
- * Provider-neutral structured-output boundary. A vendor adapter owns network and
- * SDK concerns and returns decoded JSON; role adapters own role prompts and
- * domain validation.
+ * プロバイダーに依存しない構造化出力の境界です。
+ * ベンダーアダプターは通信と SDK を担当してデコード済み JSON を返し、
+ * 役割アダプターは役割別プロンプトとドメイン検証を担当します。
  */
 export interface StructuredLlmProvider {
   generate(request: StructuredLlmRequest): Promise<unknown>;
