@@ -73,8 +73,8 @@ function assertSixFields(view: CliView): void {
   ]);
 }
 
-describe("Command & Control Runtime CLI", () => {
-  it("runs a Mission and prints all six required fields", async () => {
+describe("コマンド＆コントロール・ランタイムのコマンドラインインターフェース", () => {
+  it("ミッションを実行し、必須の6フィールドをすべて出力する", async () => {
     const directory = mkdtempSync(join(tmpdir(), "c2-cli-happy-"));
     const database = join(directory, "runtime.sqlite");
     try {
@@ -105,6 +105,23 @@ describe("Command & Control Runtime CLI", () => {
         assert.equal(durable?.tasks.length, 3);
         assert.ok(durable?.tasks.every(({ status }) => status === "completed"));
         assert.equal(durable?.events.at(-1)?.type, "MissionCompleted");
+        assert.ok((durable?.authorizationRecords.length ?? 0) > 0);
+        assert.equal(durable?.authorityGrants.length, 4);
+        assert.equal(
+          durable?.authorityGrants.filter(
+            ({ subjectId, taskId }) =>
+              subjectId === "mock-lead" && taskId === undefined,
+          ).length,
+          1,
+        );
+        assert.equal(
+          durable?.authorityGrants.filter(
+            ({ subjectId, taskId }) =>
+              subjectId === "mock-worker" && taskId !== undefined,
+          ).length,
+          3,
+        );
+        assert.equal(durable?.doctrineViolations.length, 0);
       } finally {
         store.close();
       }
@@ -128,7 +145,7 @@ describe("Command & Control Runtime CLI", () => {
     }
   });
 
-  it("prints the same six fields with durable escalation details", async () => {
+  it("永続化されたエスカレーションの詳細とともに同じ6フィールドを出力する", async () => {
     const directory = mkdtempSync(join(tmpdir(), "c2-cli-escalation-"));
     const database = join(directory, "runtime.sqlite");
     try {
@@ -162,6 +179,8 @@ describe("Command & Control Runtime CLI", () => {
           durable?.events.at(-1)?.type,
           "EscalationRequested",
         );
+        assert.equal(durable?.escalations.length, 1);
+        assert.equal(durable?.escalations[0]?.targetRole, "commander");
         assert.deepEqual(
           durable?.decisions.map(({ decision }) => decision),
           ["escalate"],

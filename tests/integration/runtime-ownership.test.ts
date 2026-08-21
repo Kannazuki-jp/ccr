@@ -24,7 +24,13 @@ const ONE_TASK_PLAN: TaskPlan = [
     successCriteria: ["The requested behavior is implemented"],
     constraints: ["Do not modify unrelated behavior"],
     authority: {
-      allowed: ["edit in-scope files"],
+      allowed: [
+        "execution.method.select",
+        "execution.tool.select",
+        "code.edit",
+        "report.submit",
+        "execution.retry",
+      ],
       prohibited: ["change external systems"],
       requiresApproval: [],
     },
@@ -66,8 +72,8 @@ function assertNoCompletion(store: SqliteStore): void {
   );
 }
 
-describe("Runtime state ownership", () => {
-  it("isolates every Agent input mutation and performs completion only through Runtime transitions", async () => {
+describe("ランタイムによる状態所有権", () => {
+  it("すべてのエージェント入力の変更を隔離し、ランタイムの状態遷移だけで完了処理を行う", async () => {
     const store = new SqliteStore();
     const input = { goal: "Preserve this original goal" };
 
@@ -152,7 +158,7 @@ describe("Runtime state ownership", () => {
     }
   });
 
-  it("rejects Commander control fields before a Mission can be created", async () => {
+  it("ミッション作成前に司令役の制御フィールドを拒否する", async () => {
     const store = new SqliteStore();
     const proposal = {
       ...structuredClone(DEFAULT_MISSION_PROPOSAL),
@@ -171,13 +177,22 @@ describe("Runtime state ownership", () => {
       );
       assert.deepEqual(store.listMissions(), []);
       assert.deepEqual(store.listTasks(), []);
-      assert.deepEqual(store.listEvents(), []);
+      assert.deepEqual(
+        store.listEvents().map(({ type }) => type),
+        ["DecisionRequested", "AuthorizationAllowed"],
+      );
+      assert.deepEqual(
+        store
+          .listAuthorizationRecords()
+          .map(({ decisionType, result }) => [decisionType, result]),
+        [["goal.create", "allow"]],
+      );
     } finally {
       store.close();
     }
   });
 
-  it("rejects Lead control fields without creating or completing Tasks", async () => {
+  it("タスクを作成または完了せずにリード役の制御フィールドを拒否する", async () => {
     const store = new SqliteStore();
     const invalidPlan = [
       {
@@ -206,7 +221,7 @@ describe("Runtime state ownership", () => {
     }
   });
 
-  it("rejects Worker control fields and leaves authoritative state uncompleted", async () => {
+  it("ワーカーの制御フィールドを拒否し、権威ある状態を未完了のまま保持する", async () => {
     const store = new SqliteStore();
     const invalidResult = {
       ...structuredClone(SUCCESS_RESULT),
@@ -243,7 +258,7 @@ describe("Runtime state ownership", () => {
     }
   });
 
-  it("rejects Evaluator control fields before any completion transition", async () => {
+  it("完了への状態遷移が行われる前に評価者の制御フィールドを拒否する", async () => {
     const store = new SqliteStore();
     const invalidEvaluation = {
       ...structuredClone(PASS_EVALUATION),
@@ -278,7 +293,7 @@ describe("Runtime state ownership", () => {
     }
   });
 
-  it("rejects unknown and cyclic Lead plan dependencies at the Runtime boundary", async () => {
+  it("ランタイム境界で未知の依存関係と循環したリード計画の依存関係を拒否する", async () => {
     const invalidPlans: TaskPlan[] = [
       [
         {

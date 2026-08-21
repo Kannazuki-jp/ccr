@@ -56,8 +56,8 @@ function assertOrdered(values: readonly number[]): void {
   }
 }
 
-describe("CommandControlRuntime integration", () => {
-  it("completes the three-task happy path in dependency and C2 routing order", async () => {
+describe("コマンド＆コントロール・ランタイムの統合テスト", () => {
+  it("依存関係と指揮統制ルーティングの順序に従う3タスクの正常系を完了する", async () => {
     const store = new SqliteStore();
     const agents = createMockAgents({ scenario: "happy" });
     try {
@@ -119,7 +119,7 @@ describe("CommandControlRuntime integration", () => {
     }
   });
 
-  it("retries the same task once, preserves both reports, then completes", async () => {
+  it("同じタスクを1回再試行し、両方のレポートを保持してから完了する", async () => {
     const store = new SqliteStore();
     const agents = createMockAgents({ scenario: "retry" });
     try {
@@ -163,7 +163,7 @@ describe("CommandControlRuntime integration", () => {
     }
   });
 
-  it("replans failed work, cancels superseded pending tasks, and completes the replacement", async () => {
+  it("失敗した作業を再計画し、置き換えられた保留中のタスクをキャンセルして代替タスクを完了する", async () => {
     const store = new SqliteStore();
     const agents = createMockAgents({ scenario: "replan" });
     try {
@@ -207,7 +207,7 @@ describe("CommandControlRuntime integration", () => {
     }
   });
 
-  it("routes a Worker escalation without invoking the Evaluator", async () => {
+  it("評価者を呼び出さずにワーカーのエスカレーションをルーティングする", async () => {
     const store = new SqliteStore();
     const agents = createMockAgents({ scenario: "escalation" });
     try {
@@ -233,7 +233,7 @@ describe("CommandControlRuntime integration", () => {
     }
   });
 
-  it("routes an Evaluator escalation after storing the successful Worker report", async () => {
+  it("ワーカーの成功レポートを保存した後に評価者のエスカレーションをルーティングする", async () => {
     const escalation: EvaluationProposal = {
       result: "fail",
       reasons: ["A Commander decision is required"],
@@ -267,7 +267,7 @@ describe("CommandControlRuntime integration", () => {
     }
   });
 
-  it("makes an unrecoverable evaluation failure terminal without completion events", async () => {
+  it("回復不能な評価失敗を完了イベントなしの終端状態にする", async () => {
     const store = new SqliteStore();
     const agents = createMockAgents({ scenario: "terminal-fail" });
     try {
@@ -295,7 +295,7 @@ describe("CommandControlRuntime integration", () => {
     }
   });
 
-  it("converts invalid Evaluator output into explicit durable failure before completion", async () => {
+  it("無効な評価者出力を完了前に明示的な永続化失敗へ変換する", async () => {
     const invalidEvaluation = {
       result: "pass",
       reasons: [],
@@ -331,7 +331,7 @@ describe("CommandControlRuntime integration", () => {
     }
   });
 
-  it("reopens persisted state and observes it without any Agent call or new event", async () => {
+  it("永続化された状態を再オープンし、エージェントの呼び出しや新しいイベントなしで確認する", async () => {
     const directory = mkdtempSync(join(tmpdir(), "c2-runtime-reopen-"));
     const database = join(directory, "runtime.sqlite");
     let missionId: string;
@@ -371,7 +371,7 @@ describe("CommandControlRuntime integration", () => {
     }
   });
 
-  it("swaps all Mock roles for LLM adapters through the same interfaces", async () => {
+  it("同じインターフェースを通じてすべてのモック役割をLLMアダプターに置き換える", async () => {
     class FakeStructuredProvider implements StructuredLlmProvider {
       public readonly requests: StructuredLlmRequest[] = [];
 

@@ -11,8 +11,8 @@ import {
   taskTransitionMap,
 } from "../../src/runtime/state-machine.js";
 
-describe("mission state machine", () => {
-  it("allows the happy path and the evaluation/replan loop", () => {
+describe("ミッション状態機械", () => {
+  it("正常系と評価・再計画ループを許可する", () => {
     assert.equal(canTransitionMission("created", "planning"), true);
     assert.equal(canTransitionMission("planning", "executing"), true);
     assert.equal(canTransitionMission("executing", "evaluating"), true);
@@ -21,13 +21,13 @@ describe("mission state machine", () => {
     assert.equal(canTransitionMission("evaluating", "completed"), true);
   });
 
-  it("supports recovery from explicit blocked and escalated states", () => {
+  it("明示的なブロック状態とエスカレーション状態からの復旧をサポートする", () => {
     assert.equal(canTransitionMission("executing", "blocked"), true);
     assert.equal(canTransitionMission("blocked", "escalated"), true);
     assert.equal(canTransitionMission("escalated", "executing"), true);
   });
 
-  it("makes terminal states terminal and rejects illegal transitions", () => {
+  it("終端状態を終端のままにし、不正な状態遷移を拒否する", () => {
     assert.deepEqual(missionTransitionMap.completed, []);
     assert.deepEqual(missionTransitionMap.failed, []);
     assert.deepEqual(missionTransitionMap.cancelled, []);
@@ -43,15 +43,15 @@ describe("mission state machine", () => {
   });
 });
 
-describe("task state machine", () => {
-  it("allows execution, evaluation, retry, and completion", () => {
+describe("タスク状態機械", () => {
+  it("実行、評価、再試行、完了を許可する", () => {
     assert.equal(canTransitionTask("pending", "running"), true);
     assert.equal(canTransitionTask("running", "evaluating"), true);
     assert.equal(canTransitionTask("evaluating", "pending"), true);
     assert.equal(canTransitionTask("evaluating", "completed"), true);
   });
 
-  it("makes terminal states terminal and rejects completed to running", () => {
+  it("終端状態を終端のままにし、完了状態から実行中への遷移を拒否する", () => {
     assert.deepEqual(taskTransitionMap.completed, []);
     assert.deepEqual(taskTransitionMap.failed, []);
     assert.deepEqual(taskTransitionMap.cancelled, []);
