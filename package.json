@@ -18,8 +18,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-test-coverage --import=tsx 'tests/**/*.test.ts'",
+    "test": "node --test --experimental-test-coverage --test-coverage-lines=90 --test-coverage-branches=80 --test-coverage-functions=90 --import=tsx 'tests/**/*.test.ts'",
     "test:plain": "node --test --import=tsx 'tests/**/*.test.ts'",
+    "ci:smoke": "node scripts/verify-built-cli.mjs",
     "start": "node --import=tsx src/cli/main.ts",
     "check": "corepack pnpm run typecheck && corepack pnpm run test && corepack pnpm run build"
   },
