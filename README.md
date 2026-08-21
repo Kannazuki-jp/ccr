@@ -33,7 +33,7 @@ Human Goal → Commander Mission → Lead Plan / Delegation
 - Corepack（pnpm 10.30.3を使用）
 
 ```bash
-corepack pnpm install --store-dir .pnpm-store
+corepack pnpm install --frozen-lockfile --store-dir .pnpm-store
 corepack pnpm run check
 ```
 
@@ -250,4 +250,6 @@ corepack pnpm run typecheck
 corepack pnpm run test
 corepack pnpm run build
 corepack pnpm run check
+corepack pnpm run ci:smoke
+git diff --check
 ```
