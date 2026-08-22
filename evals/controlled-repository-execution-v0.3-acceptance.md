@@ -37,7 +37,7 @@
 | 項目 | 規範値 |
 | --- | --- |
 | 入力 | Workspaceに`src/a.ts`を作成。Workerが`repo.list { path: "src", maxDepth: 2 }`、`repo.search { query: "answer", paths: ["src"], maxResults: 10 }`、`repo.read { path: "src/a.ts", offset: 0, limit: 4096 }`を順に提案し、Evidenceを引用したsuccess Reportを返す。Task requirementsは3 toolと`src/a.ts`を要求する。 |
-| Authorization | 3 Request全て`ALLOW`。各Requestで`execution.tool.select`と`code.read`/path scopeを満たす。 |
+| Authorization | 3 Request全て、selection Authorization（`execution.tool.select` + `tool.select` + tool scope）と全resolved pathのoperation Authorization（`code.read` + path scope）を`ALLOW`し、Evidence/permitは両者のbundleへbindする。 |
 | Side effect | Workspaceの全file hash、mtime、entry集合が実行前後で不変。process起動なし。 |
 | State | tool loop中Task=`running`。Evaluator PASSとcompletion gate後にTask=`completed`、Mission=`completed`。 |
 | Event | 各Requestのproposed、authorized、succeeded event。最後にReport、EvaluationPassed、TaskCompleted、MissionCompleted。 |
@@ -49,7 +49,7 @@
 | 項目 | 規範値 |
 | --- | --- |
 | 入力 | `src/a.ts`のread EvidenceでSHA-256を取得後、同じpathへ`repo.patch { operation: "update", content: "...", expectedSha256 }`。Authorityは`src/**`の`code.edit`。requireMutation=true。 |
-| Authorization | readとpatchが`ALLOW`。patch Authorizationはresolved `src/a.ts`へbind。 |
+| Authorization | readとpatchはそれぞれselectionとoperation Authorizationを`ALLOW`。patch Evidence/permitはselectionとresolved `src/a.ts`の`code.edit` operation Authorization bundleへbind。 |
 | Side effect | `src/a.ts`だけが完全置換され、他fileは不変。before/after hashが実fileと一致。 |
 | State | patch後もTask=`running`。必要EvidenceとEvaluator PASS後だけcompleted。 |
 | Event | `ToolRequestProposed`、`AuthorizationAllowed`、`ToolExecutionSucceeded`。最終completion events。 |
@@ -85,7 +85,7 @@
 | 項目 | 規範値 |
 | --- | --- |
 | 入力 | Policyに`unit`=`node --test ...`相当のfixed argvを登録。Workerは`test.run { commandId: "unit" }`だけを提案。 |
-| Authorization | `ALLOW`。`test.run` + `{type:"tool",tool:"unit"}`とtool selection authorityを満たす。 |
+| Authorization | selection Authorization（`execution.tool.select` + `tool.select` + `{type:"tool",tool:"test.run"}`）とoperation Authorization（`test.run` + `{type:"tool",tool:"unit"}`）を`ALLOW`。Evidence/permitは両者のbundleへbindする。 |
 | Side effect | 設定済みprocessを一回、shell=false、fixed cwd/envで実行。Repository file変更なし。 |
 | State | test中/後Task=`running`。requireSuccessfulTestとEvaluator PASS後completed可能。 |
 | Event | proposed、allowed、ToolExecutionSucceeded。 |
@@ -145,7 +145,7 @@
 | 項目 | 規範値 |
 | --- | --- |
 | 入力 | Workerがlist/search/readで対象特定、SHA付きpatch、test.runを行い、全Evidenceを根拠にsuccess Report。requirementsはread、patch、fresh successful test、対象path、mutationを要求。 |
-| Authorization | 全Requestが順に`ALLOW`。Requestごとに一意の事前Authorization。 |
+| Authorization | 全Requestでselectionと全concrete operation Authorizationが順に`ALLOW`。Requestごとに一意の事前Authorization bundleがある。 |
 | Side effect | scope内の指定fileだけが期待内容へ変更され、testは変更後に一回成功。 |
 | State | 実行中はTask=`running`。Report保存→Evaluator PASS→completion gate→Task completed→Mission completed。 |
 | Event | request/authorization/executionがsequence順。ReportSubmitted、EvaluationPassed、TaskCompleted、MissionCompletedが後続。 |
@@ -160,15 +160,15 @@
 | AC-02 | Brief §4、実装docs、threat boundary negative tests | UT-WS, UT-TB |
 | AC-03 | absolute/traversal/separator/symlink/create-parent cases | UT-WS, Scenario D |
 | AC-04 | strict union、unknown field、Runtime identity overwrite | UT-TR |
-| AC-05 | wrong request/auth/task/attempt、duplicate rejection | UT-TR, IT-AUDIT |
+| AC-05 | wrong request/selection-or-operation auth/task/attempt、bundle digest、duplicate rejection | UT-TR, IT-AUDIT |
 | AC-06 | exact、descendant、sibling-prefix、multi-root fail-closed | UT-WS |
-| AC-07 | Authorization commitがbroker invocationより先 | IT-AUDIT, Scenario J |
-| AC-08 | missing/wrong/reused permit rejection | UT-TB, IT-EXPORT |
+| AC-07 | selectionと全operation Authorizationのcommitがbroker invocationより先。multi-rootの一件DENY/ESCALATEは全体を止める | IT-AUDIT, Scenario A, J |
+| AC-08 | missing/wrong/reused authorization bundle permit rejection | UT-TB, IT-EXPORT |
 | AC-09 | filesystem snapshot/process spy | Scenarios C, D, G |
 | AC-10 | 各toolのhappy/invalid/bound tests | UT-TB, Scenarios A, B, E |
 | AC-11 | unknown shell/network tool schema拒否、public export scan | UT-TR, IT-EXPORT |
 | AC-12 | commandId only、argv injection拒否、env、cwd、timeout | UT-TB, Scenario E |
-| AC-13 | success/failure/timeout Evidence+Event transaction rollback | IT-AUDIT |
+| AC-13 | success/failure/timeout Evidence+Event transaction、observation不能なfailure/timeoutではerrorだけを保存し架空のexit code/hash/outputを拒否 | IT-AUDIT, UT-TE |
 | AC-14 | UPDATE/DELETE trigger、close/reopen、order | IT-AUDIT, Scenario J |
 | AC-15 | Worker input clone、direct broker/store非公開 | UT-WL, IT-EXPORT |
 | AC-16 | Evidence-backed evaluation input、direct state mutation拒否 | IT-CRE, 既存Evaluator isolation tests |

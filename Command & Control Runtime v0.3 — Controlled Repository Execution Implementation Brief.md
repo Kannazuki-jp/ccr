@@ -106,12 +106,12 @@ ToolRequest、LLM出力、Repository内のpath文字列とfile contentはuntrust
 
 - Runtime process、Doctrine Enforcer、ToolBroker、SQLite Storeの実装
 - Runtime起動者が与えるWorkspace rootとTool Policy
-- allowlistへ登録されたtest executable、固定argv、およびtest対象Repository
+- allowlistへ登録されたtest executable、固定argv、cwd、envを含むTestCommandPolicy
 - OS filesystem APIとSQLite
 
 ### 4.3 明示的に保証しない境界
 
-v0.3はOS sandbox、container、VMではない。allowlist済みtest command自身またはRepository内のtest codeが悪意を持つ場合、そのprocessによるfilesystem/network accessを完全には封じ込めない。この保証が必要なら、将来のsandbox adapterでToolBrokerの下を置換する。
+v0.3はOS sandbox、container、VMではない。TestCommandPolicyはtrusted operator configurationだが、そのcommandが実行するRepository content、test code、dependencyはuntrusted inputのままである。固定 executable / argv はAgentによるshell injectionを防ぐだけであり、allowlist済みtest command自身またはRepository内のtest codeが悪意を持つ場合、そのprocessによるfilesystem/network/process accessを完全には封じ込めない。この保証が必要なら、将来のsandbox adapterでToolBrokerの下を置換する。
 
 同様に、Runtimeと同じOS user、DB管理者、同時にWorkspaceを書き換える外部processからの改ざん、完全なcrash recoveryは対象外である。これらを理由に、Agentへ自由shellやcredentialを渡してはならない。
 
@@ -216,18 +216,23 @@ type ToolInput<TName extends ToolName> =
 ToolEvidenceはToolBrokerの観測をRuntimeが正規化したappend-only recordである。
 
 ```ts
-interface ToolEvidence<TName extends ToolName = ToolName> {
+interface ToolAuthorizationBundle {
+  readonly selectionAuthorizationId: string;
+  readonly operationAuthorizationIds: readonly [string, ...string[]];
+  readonly normalizedResources: readonly ResourceScope[];
+  readonly digest: string; // canonical selection/operation/resource serialization
+}
+
+interface ToolEvidenceBase<TName extends ToolName = ToolName> {
   readonly id: string;
   readonly requestId: string;
-  readonly authorizationId: string; // persisted ALLOW record
+  readonly authorization: ToolAuthorizationBundle; // persisted ALLOW records
   readonly missionId: string;
   readonly taskId: string;
   readonly actorId: string;
   readonly attempt: number;
   readonly sequence: number;
   readonly tool: TName;
-  readonly status: "succeeded" | "failed" | "timed_out";
-  readonly observation: ToolObservation<TName>;
   readonly sideEffects: readonly ToolSideEffect[];
   readonly startedAt: Date;
   readonly finishedAt: Date;
@@ -239,6 +244,21 @@ interface ToolEvidence<TName extends ToolName = ToolName> {
     readonly message: string;
   };
 }
+
+type ToolEvidence<TName extends ToolName = ToolName> =
+  | (ToolEvidenceBase<TName> & {
+      readonly status: "succeeded";
+      readonly observation: ToolObservation<TName>;
+    })
+  | (ToolEvidenceBase<TName> & {
+      readonly status: "failed" | "timed_out";
+      // Omit when execution never reached an observable tool boundary.
+      readonly observation?: Partial<ToolObservation<TName>>;
+      readonly error: {
+        readonly code: string;
+        readonly message: string;
+      };
+    });
 
 interface ToolSideEffect {
   readonly path: string;
@@ -260,10 +280,10 @@ interface ToolSideEffect {
 共通規則：
 
 1. Evidenceのidentityと時刻はRuntime/ToolBrokerだけが作る。
-2. Evidenceは対応する保存済み`ALLOW` Authorizationを必ず参照する。
+2. Evidenceは、Tool selection用1件と全concrete operation/resource用1件以上からなる保存済み`ALLOW` Authorization bundleを必ず参照する。単一の`authorizationId`でbundleを代用してはならない。
 3. `DENY`と`ESCALATE`ではToolBrokerを呼ばず、ToolEvidenceを捏造しない。非実行の証拠はAuthorization/Eventである。
 4. 実行開始後は成功、tool-level failure、timeoutのいずれでもEvidenceを作る。
-5. `outputSha256`はcanonical JSON serializationしたobservation、sideEffects、errorから計算する。
+5. `outputSha256`はcanonical JSON serializationした存在するobservation、sideEffects、errorから計算する。失敗またはtimeoutで取得できなかったexit code、hash、output、observationを空値として捏造してはならない。
 6. Worker/Evaluatorが返したEvidence IDや内容を保存済みrecordの代わりに使わない。
 7. 大きなoutputはpolicy上限で切り詰め、hash、元byte数、`truncated: true`を残す。
 
@@ -299,17 +319,18 @@ Runtimeは各Worker turnで次の順序をMUSTで守る。
 3. Parse strict ToolRequest input
 4. Resolve Workspace path / command and derive Permission
 5. Persist ToolRequestProposed event and request record
-6. DoctrineEnforcer.authorize(...)
-7. Persist Authorization result
-8a. DENY      -> no execution; return denial control result
-8b. ESCALATE  -> no execution; persist escalation; block Task; escalate Mission
-8c. ALLOW     -> invoke ToolBroker with an internal one-shot permit
-9. ToolBroker executes exactly once with timeout/output limits
-10. Runtime constructs and persists ToolEvidence + ToolExecuted event
-11. Only after commit, return a clone of Evidence to Worker
+6. Authorize selection Decision `execution.tool.select` with authority `tool.select` + `{ type: "tool", tool: request.tool }`
+7. Authorize every derived concrete operation/resource from §8
+8. Persist every Authorization result and construct a bundle only when all are `ALLOW`
+9a. any DENY      -> no execution; return denial control result
+9b. any ESCALATE  -> no execution; persist escalation; block Task; escalate Mission
+9c. all ALLOW     -> invoke ToolBroker with an internal one-shot permit bound to the bundle
+10. ToolBroker executes exactly once with timeout/output limits
+11. Runtime constructs and persists ToolEvidence + ToolExecuted event
+12. Only after commit, return a clone of Evidence to Worker
 ```
 
-ToolBrokerのpublic APIはraw `ToolRequest`だけでは実行できず、Doctrine Enforcerの保存済みALLOWからRuntime内部で発行するone-shot permitを要求する。permitはrequest ID、authorization ID、tool、resourceにbindし、一度だけconsumeできる。既存`transition-permit.ts`と同様、発行/consume capabilityはpackage public exportに含めない。
+Tool selectionとoperation authorizationは独立したDecision/Authorizationである。`repo.search`のように複数rootを持つRequestはselection Authorization 1件とrootごとのoperation Authorizationを必要とし、いずれか一件でも`DENY`または`ESCALATE`なら実行しない。ToolBrokerのpublic APIはraw `ToolRequest`だけでは実行できず、すべて保存済み`ALLOW`である`ToolAuthorizationBundle`からRuntime内部で発行するone-shot permitを要求する。permitはrequest ID、selection Authorization ID、順序付きoperation Authorization IDs、bundle digest、tool、normalized resourcesにbindし、一度だけconsumeできる。既存`transition-permit.ts`と同様、発行/consume capabilityはpackage public exportに含めない。
 
 Authorization/persistence failureではfail closedとする。実行前の失敗は副作用ゼロである。副作用後にEvidence commitが失敗した場合、Taskを完了せずMissionを`blocked`へ移し、mutationを自動再実行しない。完全なcrash recoveryはNon-goalだが、unknown outcomeを成功扱いしてはならない。
 
@@ -434,16 +455,19 @@ tool_requests
   tool, input_json, requested_at
 
 tool_evidence
-  id, request_id, authorization_id, mission_id, task_id, actor_id,
+  id, request_id, authorization_bundle_json, mission_id, task_id, actor_id,
   attempt, sequence, tool, status, observation_json, side_effects_json,
   started_at, finished_at, duration_ms, output_sha256, truncated, error_json
+
+tool_request_authorizations
+  request_id, authorization_id, kind(selection|operation), resource_json, ordinal
 ```
 
 規則：
 
 1. `tool_requests`と`tool_evidence`はUPDATE/DELETE triggerでappend-onlyにする。
-2. `(task_id, attempt, sequence)`、`request_id`、`authorization_id`の一意性をDBでも強制する。
-3. foreign keyでMission、Task、Authorization、Requestを結ぶ。
+2. `(task_id, attempt, sequence)`、`request_id`、`(request_id, authorization_id)`、`(request_id, kind, ordinal)`の一意性をDBでも強制する。
+3. foreign keyでMission、Task、全Authorization、Requestを結ぶ。各executed Requestにはselection 1件とoperation 1件以上の`ALLOW`が存在し、Evidenceのbundle digestを再計算できなければならない。
 4. Request proposal/Event、Authorizationは実行前にcommitする。
 5. Evidenceと`ToolExecutionSucceeded|Failed|TimedOut` Eventは一transactionでcommitする。
 6. Evidence queryはMission/Task/attempt/sequence順の決定論的順序を持つ。
@@ -487,7 +511,7 @@ RuntimeはEvaluator PASS後、Taskを`completed`へ遷移する直前に次を�
 - Task/Report/Evaluationが同じmission、task、attemptを参照する。
 - Workerのfinal Reportが保存済みで、status=`success`である。
 - 参照Evidenceが全てDBに存在し、同じTask/attemptに属する。
-- 各Evidenceに同じRequestと事前保存済みALLOWが存在する。
+- 各Evidenceに同じRequest、事前保存済みselection ALLOW、全concrete resourceのoperation ALLOW、および再計算可能なauthorization bundle digestが存在する。
 - required tool/pathがsuccessful Evidenceで満たされる。
 - `requireMutation`なら`repo.patch`の`applied: true` side effectがある。
 - `requireSuccessfulTest`なら最新の関連`test.run`がexit 0である。後続patchがある場合、そのpatch後のtestでなければならない。
@@ -543,6 +567,10 @@ RuntimeはEvaluator PASS後、Taskを`completed`へ遷移する直前に次を�
 
 同時実装できるのはV03-02完了後のV03-04とV03-05だけである。V03-06をToolBroker未完成のfakeだけで「完成」としてはならない。
 
+### 18.1 後続Issueの同期
+
+本書をv0.3の正本とする。実装開始前に、後続Issue #3〜#10の本文・acceptance criteriaを本書とacceptance specificationへ同期する。特に#3/#4のbyte-range readとsingle-file complete-replacement patch、#5/#6/#9/#10のauthorization bundleとfailure observation、#7/#8のconcrete OpenAI Provider非対象化を反映する。#7はv0.3 milestoneから外し、後続milestoneで独立して計画する。Issue本文が同期されるまで、本書と矛盾する旧contractを実装根拠にしてはならない。
+
 想定配置：
 
 ```text
@@ -587,13 +615,13 @@ Unit testの寄せ集めをScenario testの代わりにしてはならない。�
 - [ ] **AC-02** Threat Boundaryとtrusted/non-trusted要素が実装docsに一致する。
 - [ ] **AC-03** Workspace rootはRuntime-ownedでcanonical化され、外部pathとsymlink escapeを拒否する。
 - [ ] **AC-04** ToolRequestはstrict schemaで、identity/timestampをRuntimeだけが付与する。
-- [ ] **AC-05** ToolEvidenceはRequest、ALLOW Authorization、Task attemptへbindされる。
+- [ ] **AC-05** ToolEvidenceはRequest、selection ALLOW、全operation ALLOW、Task attemptへbundleとしてbindされる。
 - [ ] **AC-06** ResourceScopeからpath/commandへのmappingがsegment単位でfail closedする。
 
 ### Authorization / Execution
 
-- [ ] **AC-07** 全RequestがToolBroker実行前にDoctrine認可・永続化を通る。
-- [ ] **AC-08** ToolBrokerはone-shot permitを持つALLOW Requestだけを一度実行する。
+- [ ] **AC-07** 全RequestがToolBroker実行前にTool selectionと全concrete operationのDoctrine認可・永続化を通る。
+- [ ] **AC-08** ToolBrokerは完全なALLOW authorization bundleへbindされたone-shot permitを持つRequestだけを一度実行する。
 - [ ] **AC-09** DENYとESCALATEはfilesystem/process副作用を起こさない。
 - [ ] **AC-10** 5 toolが§12のbounded contractを満たす。
 - [ ] **AC-11** arbitrary shell/network/credential accessをbuilt-in capabilityとして公開しない。
