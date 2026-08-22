@@ -16,6 +16,10 @@ Human Goal → Commander Mission → Lead Plan / Delegation
 
 実装仕様は [v0.2 Implementation Brief](./Command%20%26%20Control%20Runtime%20v0.2%20%E2%80%94%20Doctrine%20Enforcement%20Implementation%20Brief.md)、規範は [Decision Rights Doctrine](./.agents/doctrine/decision-rights.md) です。v0.1のC2ループを維持したまま、重要操作を決定論的な `ALLOW / DENY / ESCALATE` 判定へ通します。複数Worker、並列実行、動的Command Chain、Policy DSL、分散Runtimeなどはv0.2の対象外です。
 
+## Roadmap
+
+次のmilestoneは **v0.3 Controlled Repository Execution** です。Runtime-ownedなWorkspace、認可済みToolBroker、`repo.list / repo.search / repo.read / repo.patch / test.run`、append-only ToolEvidence、Evidence-based completionを追加します。現在は[Implementation Brief](./Command%20%26%20Control%20Runtime%20v0.3%20%E2%80%94%20Controlled%20Repository%20Execution%20Implementation%20Brief.md)と[Acceptance Specification](./evals/controlled-repository-execution-v0.3-acceptance.md)が確定した段階であり、v0.3 product codeが実装済みであることは意味しません。
+
 ## Doctrine Enforcement
 
 - Decision TypeごとのHuman / Commander / Lead / Worker / Evaluator / Runtime境界
