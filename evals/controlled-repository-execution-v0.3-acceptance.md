@@ -204,6 +204,6 @@ git diff --check
 
 ## 6. 現在の証拠境界
 
-Issue #3 の domain contract 部分は実装済みである。`UT-TR`は strict ToolRequest proposal / Runtime-bound request、5つの built-in tool と決定論的 action mapping、path/patch input の拒否、authorization bundle、success / failed / timed_out Evidence、JSON hydrate を確認する。
+Issue #3 の domain contract 部分は実装済みである。`UT-TR`は strict ToolRequest proposal / Runtime-bound request、5つの built-in tool と決定論的 action mapping、NUL を含む非canonical path と patch input の拒否、selection Authorization と operation Authorization/resource の一対一対応を持つ authorization bundle、`repo.read` content を含む success Evidence、partial observation を許す failed / timed_out Evidence、JSON hydrate を確認する。
 
 ただし、これは v0.3 product code 全体のPASSを意味しない。Workspace resolver、ToolBroker、SQLite append-only persistence、Worker tool loop、Scenario A–J は後続Issueの範囲であり、未実装である。v0.2またはこの domain contract のcheck結果は、それらRuntime enforcementの代用にならない。

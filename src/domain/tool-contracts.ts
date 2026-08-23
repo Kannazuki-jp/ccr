@@ -24,6 +24,7 @@ export const RelativeRepositoryPathSchema = z.string().superRefine((value, conte
     value.length === 0 ||
     value.startsWith("/") ||
     /^[A-Za-z]:/.test(value) ||
+    value.includes("\0") ||
     value.includes("\\") ||
     value.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..") &&
       value !== "."
@@ -160,6 +161,7 @@ export function bindToolRequest(
   return ToolRequestSchema.parse({ ...binding.data, ...parsedProposal });
 }
 
+/** Operation authorization and normalized resource at the same index form one concrete permit. */
 export const ToolAuthorizationBundleSchema = z.object({
   selectionAuthorizationId: IdentifierSchema,
   operationAuthorizationIds: z.tuple([IdentifierSchema]).rest(IdentifierSchema).superRefine((ids, context) => {
@@ -169,7 +171,22 @@ export const ToolAuthorizationBundleSchema = z.object({
   }),
   normalizedResources: z.array(ResourceScopeSchema).min(1),
   digest: Sha256Schema,
-}).strict();
+}).strict().superRefine((bundle, context) => {
+  if (bundle.operationAuthorizationIds.includes(bundle.selectionAuthorizationId)) {
+    context.addIssue({
+      code: "custom",
+      message: "selection authorization must be independent from operation authorizations",
+      path: ["operationAuthorizationIds"],
+    });
+  }
+  if (bundle.operationAuthorizationIds.length !== bundle.normalizedResources.length) {
+    context.addIssue({
+      code: "custom",
+      message: "each operation authorization must have one normalized resource",
+      path: ["normalizedResources"],
+    });
+  }
+});
 
 export const ToolSideEffectSchema = z.object({
   path: RelativeRepositoryPathSchema,
@@ -207,6 +224,7 @@ const RepoReadObservationSchema = z.object({
   offset: NonNegativeIntegerSchema,
   bytesRead: NonNegativeIntegerSchema,
   totalBytes: NonNegativeIntegerSchema,
+  content: ToolTextSchema,
   contentSha256: Sha256Schema,
 }).strict();
 

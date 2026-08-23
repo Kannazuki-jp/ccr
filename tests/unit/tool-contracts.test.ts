@@ -7,6 +7,7 @@ import {
   RepoReadInputSchema,
   RepoSearchInputSchema,
   TestRunInputSchema,
+  ToolAuthorizationBundleSchema,
   ToolEvidenceSchema,
   bindToolRequest,
   InvalidToolInputError,
@@ -117,8 +118,11 @@ describe("ToolRequest contract", () => {
     assert.equal(ToolRequestProposalSchema.safeParse({ tool: "shell.run", input: {} }).success, false);
     assert.equal(ToolRequestProposalSchema.safeParse({ tool: "repo.read", input: { path: "a", maxDepth: 1 } }).success, false);
     assert.equal(RepoReadInputSchema.safeParse({ path: "/etc/passwd", offset: 0, limit: 1 }).success, false);
+    assert.equal(RepoReadInputSchema.safeParse({ path: "src/a.ts", offset: 0, limit: 1 }).success, true);
     assert.equal(RepoReadInputSchema.safeParse({ path: "src/../secret", offset: 0, limit: 1 }).success, false);
     assert.equal(RepoReadInputSchema.safeParse({ path: "src\\a.ts", offset: 0, limit: 1 }).success, false);
+    assert.equal(RepoReadInputSchema.safeParse({ path: "src/a\0.ts", offset: 0, limit: 1 }).success, false);
+    assert.equal(RepoReadInputSchema.safeParse({ path: "\0", offset: 0, limit: 1 }).success, false);
     assert.equal(RepoListInputSchema.safeParse({ path: ".", maxDepth: 0, recursive: true }).success, false);
     assert.throws(() => parseToolRequestProposal({ tool: "shell.run", input: {} }), UnsupportedToolError);
     assert.throws(() => parseToolRequestProposal({ tool: "repo.read", input: { path: "/x", offset: 0, limit: 1 } }), InvalidToolInputError);
@@ -137,7 +141,7 @@ describe("ToolEvidence contract", () => {
     const observations = [
       ["repo.list", { entries: [{ path: "src", kind: "directory", size: 0 }] }],
       ["repo.search", { matches: [{ path: "src/a.ts", line: 1, column: 1, excerpt: "needle" }], scannedFileCount: 1 }],
-      ["repo.read", { offset: 0, bytesRead: 1, totalBytes: 1, contentSha256: hash }],
+      ["repo.read", { offset: 0, bytesRead: 1, totalBytes: 1, content: "x", contentSha256: hash }],
       ["repo.patch", { operation: "create", beforeSha256: null, afterSha256: hash, bytes: 1 }],
       ["test.run", { commandId: "unit", exitCode: 0, signal: null, stdout: { summary: "ok", sha256: hash, bytes: 2 }, stderr: { summary: "none", sha256: hash, bytes: 0 } }],
     ] as const;
@@ -150,16 +154,74 @@ describe("ToolEvidence contract", () => {
     }
   });
 
-  it("allows partial observations only for a failed or timed-out execution", () => {
-    const failed = validEvidence("repo.read", {}, {
-      status: "timed_out",
-      error: { code: "deadline", message: "read deadline elapsed" },
+  it("requires content for successful reads but permits partial failed and timed-out observations", () => {
+    const successfulWithoutContent = validEvidence("repo.read", {
+      offset: 0,
+      bytesRead: 1,
+      totalBytes: 1,
+      contentSha256: hash,
     });
-    assert.equal(ToolEvidenceSchema.safeParse(failed).success, true);
+    assert.equal(ToolEvidenceSchema.safeParse(successfulWithoutContent).success, false);
+    assert.equal(ToolEvidenceSchema.safeParse(validEvidence("repo.read", {
+      offset: 0,
+      bytesRead: 32_769,
+      totalBytes: 32_769,
+      content: "x".repeat(32_769),
+      contentSha256: hash,
+    })).success, false);
+
+    for (const status of ["failed", "timed_out"] as const) {
+      const incomplete = validEvidence("repo.read", { offset: 0 }, {
+        status,
+        error: { code: "deadline", message: "read did not complete" },
+      });
+      assert.equal(ToolEvidenceSchema.safeParse(incomplete).success, true, status);
+    }
+  });
+
+  it("binds each operation authorization to exactly one normalized resource", () => {
+    const oneOperation = {
+      selectionAuthorizationId: ids.selection,
+      operationAuthorizationIds: [ids.operation],
+      normalizedResources: [{ type: "path", pattern: "src/a.ts" }],
+      digest: hash,
+    };
+    assert.equal(ToolAuthorizationBundleSchema.safeParse(oneOperation).success, true);
+    assert.equal(ToolAuthorizationBundleSchema.safeParse({
+      ...oneOperation,
+      operationAuthorizationIds: [ids.operation, "00000000-0000-4000-8000-000000000007"],
+      normalizedResources: [
+        { type: "path", pattern: "src/a.ts" },
+        { type: "path", pattern: "src/b.ts" },
+      ],
+    }).success, true);
+    assert.equal(ToolAuthorizationBundleSchema.safeParse({
+      ...oneOperation,
+      normalizedResources: [
+        { type: "path", pattern: "src/a.ts" },
+        { type: "path", pattern: "src/b.ts" },
+      ],
+    }).success, false);
+    assert.equal(ToolAuthorizationBundleSchema.safeParse({
+      ...oneOperation,
+      operationAuthorizationIds: [ids.operation, "00000000-0000-4000-8000-000000000007"],
+    }).success, false);
+    assert.equal(ToolAuthorizationBundleSchema.safeParse({
+      ...oneOperation,
+      operationAuthorizationIds: [ids.operation, ids.operation],
+      normalizedResources: [
+        { type: "path", pattern: "src/a.ts" },
+        { type: "path", pattern: "src/b.ts" },
+      ],
+    }).success, false);
+    assert.equal(ToolAuthorizationBundleSchema.safeParse({
+      ...oneOperation,
+      operationAuthorizationIds: [ids.selection],
+    }).success, false);
   });
 
   it("rejects unverifiable or inconsistent evidence", () => {
-    const read = validEvidence("repo.read", { offset: 0, bytesRead: 1, totalBytes: 1, contentSha256: hash });
+    const read = validEvidence("repo.read", { offset: 0, bytesRead: 1, totalBytes: 1, content: "x", contentSha256: hash });
     assert.equal(ToolEvidenceSchema.safeParse({ ...read, sideEffects: [{ path: "a", operation: "update", beforeSha256: hash, afterSha256: hash, applied: true }] }).success, false);
     assert.equal(ToolEvidenceSchema.safeParse({ ...read, finishedAt: "2026-08-22T23:59:59.999Z" }).success, false);
     assert.equal(ToolEvidenceSchema.safeParse({ ...read, durationMs: 51 }).success, false);
@@ -182,9 +244,10 @@ describe("ToolEvidence contract", () => {
   });
 
   it("round-trips persisted JSON through schema hydration", () => {
-    const original = validEvidence("repo.read", { offset: 0, bytesRead: 1, totalBytes: 1, contentSha256: hash });
+    const original = validEvidence("repo.read", { offset: 0, bytesRead: 1, totalBytes: 1, content: "x", contentSha256: hash });
     const hydrated = ToolEvidenceSchema.parse(JSON.parse(JSON.stringify(original)));
     assert.ok(hydrated.startedAt instanceof Date);
+    assert.match(JSON.stringify(hydrated), /"content":"x"/);
     assert.equal(JSON.stringify(hydrated), JSON.stringify(ToolEvidenceSchema.parse(original)));
   });
 });
