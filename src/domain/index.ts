@@ -11,3 +11,4 @@ export * from "./decision-request.js";
 export * from "./doctrine-violation.js";
 export * from "./escalation.js";
 export * from "./authorization-result.js";
+export * from "./tool-contracts.js";
