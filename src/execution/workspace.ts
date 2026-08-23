@@ -28,9 +28,11 @@ import type {
 import {
   assertWorkspacePathIsNotProtected,
   InvalidPatchError,
+  isWorkspacePathProtected,
   normalizeWorkspacePath,
   WorkspaceBinaryFileError,
   WorkspaceBoundaryError,
+  WorkspaceFilesystemError,
   WorkspaceLimitError,
   WorkspacePatchPreconditionError,
   WorkspacePathError,
@@ -220,12 +222,11 @@ export class Workspace {
     }
 
     const files = new Set<string>();
-    const fileBudget = { count: 0 };
     for (const root of roots) {
       if (root.kind === "file") {
-        files.add(root.relativePath);
+        this.#addSearchFile(files, root.relativePath);
       } else {
-        await this.#collectSearchFiles(root.absolutePath, root.relativePath, files, fileBudget);
+        await this.#collectSearchFiles(root.absolutePath, root.relativePath, files);
       }
     }
 
@@ -391,7 +392,7 @@ export class Workspace {
       }
     }
 
-    const rootStats = await fs.lstat(this.#canonicalRootPath);
+    const rootStats = await inspectExistingPath(this.#canonicalRootPath);
     return {
       relativePath,
       absolutePath: this.#canonicalRootPath,
@@ -411,13 +412,13 @@ export class Workspace {
     budget: { bytes: number },
   ): Promise<void> {
     if (depth >= maxDepth) return;
-    const names = await fs.readdir(absoluteDirectoryPath);
+    const names = await readDirectoryNames(absoluteDirectoryPath);
     names.sort(compareStrings);
     for (const name of names) {
       const relativePath = joinRelativePath(relativeDirectoryPath, name);
-      if (isProtectedPath(relativePath)) continue;
+      if (isWorkspacePathProtected(relativePath)) continue;
       const candidate = path.join(absoluteDirectoryPath, name);
-      const stats = await fs.lstat(candidate);
+      const stats = await inspectExistingPath(candidate);
       const entry: WorkspaceListEntry = {
         path: relativePath,
         kind: listKindForStats(stats),
@@ -457,30 +458,33 @@ export class Workspace {
     absoluteDirectoryPath: string,
     relativeDirectoryPath: string,
     files: Set<string>,
-    budget: { count: number },
   ): Promise<void> {
-    const names = await fs.readdir(absoluteDirectoryPath);
+    const names = await readDirectoryNames(absoluteDirectoryPath);
     names.sort(compareStrings);
     for (const name of names) {
       const relativePath = joinRelativePath(relativeDirectoryPath, name);
-      if (isProtectedPath(relativePath)) continue;
+      if (isWorkspacePathProtected(relativePath)) continue;
       const candidate = path.join(absoluteDirectoryPath, name);
-      const stats = await fs.lstat(candidate);
+      const stats = await inspectExistingPath(candidate);
       if (stats.isSymbolicLink()) continue;
       if (stats.isDirectory()) {
         const revalidated = await this.#resolveExisting(relativePath);
         if (revalidated.kind !== "directory") {
           throw new WorkspaceTargetError("Repository search encountered a non-directory target");
         }
-        await this.#collectSearchFiles(revalidated.absolutePath, relativePath, files, budget);
+        await this.#collectSearchFiles(revalidated.absolutePath, relativePath, files);
       } else if (stats.isFile()) {
-        if (budget.count === this.#limits.maxSearchFiles) {
-          throw new WorkspaceLimitError("Repository search file count exceeds the Workspace limit");
-        }
-        budget.count += 1;
-        files.add(relativePath);
+        this.#addSearchFile(files, relativePath);
       }
     }
+  }
+
+  #addSearchFile(files: Set<string>, relativePath: string): void {
+    if (files.has(relativePath)) return;
+    if (files.size === this.#limits.maxSearchFiles) {
+      throw new WorkspaceLimitError("Repository search file count exceeds the Workspace limit");
+    }
+    files.add(relativePath);
   }
 
   async #readUtf8File(file: ResolvedPath, maximumBytes: number): Promise<Buffer> {
@@ -494,7 +498,7 @@ export class Workspace {
     if (revalidated.kind !== "file") {
       throw new WorkspaceTargetError("Repository target changed before it could be read");
     }
-    const contents = await fs.readFile(revalidated.absolutePath);
+    const contents = await readFileContents(revalidated.absolutePath);
     if (contents.byteLength > maximumBytes) {
       throw new WorkspaceLimitError("Repository file exceeds the Workspace limit");
     }
@@ -553,7 +557,7 @@ async function lstatIfExists(candidate: string): Promise<Stats | undefined> {
     return await fs.lstat(candidate);
   } catch (error) {
     if (isNotFoundError(error)) return undefined;
-    throw new WorkspaceTargetError("Repository path could not be inspected");
+    throw new WorkspaceFilesystemError();
   }
 }
 
@@ -577,14 +581,34 @@ function joinRelativePath(parent: string, name: string): string {
   return parent === "." ? name : `${parent}/${name}`;
 }
 
-function isProtectedPath(relativePath: string): boolean {
-  return relativePath === ".git" || relativePath.startsWith(".git/");
-}
-
 function compareStrings(left: string, right: string): number {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
+}
+
+async function readDirectoryNames(absolutePath: string): Promise<string[]> {
+  try {
+    return await fs.readdir(absolutePath);
+  } catch {
+    throw new WorkspaceFilesystemError();
+  }
+}
+
+async function inspectExistingPath(absolutePath: string): Promise<Stats> {
+  try {
+    return await fs.lstat(absolutePath);
+  } catch {
+    throw new WorkspaceFilesystemError();
+  }
+}
+
+async function readFileContents(absolutePath: string): Promise<Buffer> {
+  try {
+    return await fs.readFile(absolutePath);
+  } catch {
+    throw new WorkspaceFilesystemError();
+  }
 }
 
 function compareByPath(left: WorkspaceListEntry, right: WorkspaceListEntry): number {

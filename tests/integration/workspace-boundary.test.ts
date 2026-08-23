@@ -9,6 +9,7 @@ import {
   InvalidPatchError,
   Workspace,
   WorkspaceBinaryFileError,
+  WorkspaceFilesystemError,
   WorkspaceLimitError,
   WorkspacePathError,
   WorkspaceProtectedPathError,
@@ -144,6 +145,90 @@ describe("Workspace root and path boundary", () => {
       assert.deepEqual(await workspace.list({ path: ".", maxDepth: 2 }), { entries: [] });
     });
   });
+
+  it("protects credential-sensitive paths across every Workspace operation", async () => {
+    await withWorkspace(async ({ root }) => {
+      const protectedPaths = [".env", ".env.local", "config/private.pem", "keys/secret.key"];
+      await fs.mkdir(path.join(root, "config"));
+      await fs.mkdir(path.join(root, "keys"));
+      for (const relativePath of protectedPaths) {
+        await fs.writeFile(path.join(root, relativePath), "credential needle");
+      }
+      await fs.writeFile(path.join(root, "public.txt"), "public needle");
+      const workspace = await Workspace.create({ rootPath: root });
+
+      for (const relativePath of protectedPaths) {
+        await assert.rejects(
+          () => workspace.resolvePath(relativePath),
+          hasCode(WorkspaceProtectedPathError, "WORKSPACE_PROTECTED_PATH"),
+        );
+        await assert.rejects(
+          () => workspace.read({ path: relativePath, offset: 0, limit: 100 }),
+          hasCode(WorkspaceProtectedPathError, "WORKSPACE_PROTECTED_PATH"),
+        );
+        await assert.rejects(
+          () => workspace.search({ query: "needle", paths: [relativePath], maxResults: 10 }),
+          hasCode(WorkspaceProtectedPathError, "WORKSPACE_PROTECTED_PATH"),
+        );
+        await assert.rejects(
+          () => workspace.validatePatch({ path: relativePath, operation: "create", content: "replacement" }),
+          hasCode(WorkspaceProtectedPathError, "WORKSPACE_PROTECTED_PATH"),
+        );
+      }
+
+      const listed = await workspace.list({ path: ".", maxDepth: 3 });
+      assert.deepEqual(listed.entries.map((entry) => entry.path), ["config", "keys", "public.txt"]);
+      const searched = await workspace.search({ query: "needle", paths: ["."], maxResults: 10 });
+      assert.deepEqual(searched.matches.map((match) => match.path), ["public.txt"]);
+    });
+  });
+
+  it("sanitizes filesystem failures and symlink failures without absolute path disclosure", {
+    skip: process.platform === "win32" || process.getuid?.() === 0,
+  }, async () => {
+    await withWorkspace(async ({ root, outside }) => {
+      const privateFile = path.join(root, "private.txt");
+      const privateDirectory = path.join(root, "private-directory");
+      await fs.writeFile(privateFile, "private");
+      await fs.mkdir(privateDirectory);
+      await fs.writeFile(path.join(outside, "secret.txt"), "outside");
+      await fs.symlink(path.join(outside, "secret.txt"), path.join(root, "escape"));
+      const workspace = await Workspace.create({ rootPath: root });
+
+      await fs.chmod(privateFile, 0o000);
+      await fs.chmod(privateDirectory, 0o000);
+      try {
+        for (const operation of [
+          () => workspace.read({ path: "private.txt", offset: 0, limit: 10 }),
+          () => workspace.search({ query: "private", paths: ["private.txt"], maxResults: 10 }),
+          () => workspace.list({ path: "private-directory", maxDepth: 1 }),
+          () => workspace.resolvePath("private-directory/child.txt"),
+        ]) {
+          await assert.rejects(operation, (error: unknown) => {
+            assert.ok(error instanceof WorkspaceFilesystemError);
+            assert.equal(error.code, "WORKSPACE_FILESYSTEM_ERROR");
+            assert.equal(error.message.includes(root), false);
+            assert.equal(error.message.includes(outside), false);
+            assert.equal(error.cause, undefined);
+            return true;
+          });
+        }
+        await assert.rejects(
+          () => workspace.read({ path: "escape", offset: 0, limit: 10 }),
+          (error: unknown) => {
+            assert.ok(error instanceof WorkspaceSymlinkError);
+            assert.equal(error.code, "WORKSPACE_ESCAPE");
+            assert.equal(error.message.includes(root), false);
+            assert.equal(error.message.includes(outside), false);
+            return true;
+          },
+        );
+      } finally {
+        await fs.chmod(privateFile, 0o600);
+        await fs.chmod(privateDirectory, 0o700);
+      }
+    });
+  });
 });
 
 describe("Workspace bounded repository primitives", () => {
@@ -238,6 +323,38 @@ describe("Workspace bounded repository primitives", () => {
       await assert.rejects(() => workspace.search({ query: "x", paths: ["src/large.ts"], maxResults: 1 }), WorkspaceLimitError);
       const countLimited = await Workspace.create({ rootPath: root, maxSearchFiles: 1 });
       await assert.rejects(() => countLimited.search({ query: "needle", paths: ["src"], maxResults: 1 }), WorkspaceLimitError);
+    });
+  });
+
+  it("counts unique direct and recursively discovered search files against one budget", async () => {
+    await withWorkspace(async ({ root }) => {
+      await fs.mkdir(path.join(root, "src"));
+      await fs.writeFile(path.join(root, "src", "a.ts"), "needle a");
+      await fs.writeFile(path.join(root, "src", "b.ts"), "needle b");
+
+      const oneFile = await Workspace.create({ rootPath: root, maxSearchFiles: 1 });
+      await assert.rejects(
+        () => oneFile.search({ query: "needle", paths: ["src/a.ts", "src/b.ts"], maxResults: 10 }),
+        hasCode(WorkspaceLimitError, "WORKSPACE_LIMIT_EXCEEDED"),
+      );
+      await assert.rejects(
+        () => oneFile.search({ query: "needle", paths: ["src"], maxResults: 10 }),
+        hasCode(WorkspaceLimitError, "WORKSPACE_LIMIT_EXCEEDED"),
+      );
+
+      assert.deepEqual(
+        await oneFile.search({ query: "needle", paths: ["src/a.ts"], maxResults: 10 }),
+        {
+          matches: [{ path: "src/a.ts", line: 1, column: 1, excerpt: "needle a" }],
+          scannedFileCount: 1,
+          truncated: false,
+        },
+      );
+
+      const twoFiles = await Workspace.create({ rootPath: root, maxSearchFiles: 2 });
+      const overlapping = await twoFiles.search({ query: "needle", paths: ["src/a.ts", "src"], maxResults: 10 });
+      assert.deepEqual(overlapping.matches.map((match) => match.path), ["src/a.ts", "src/b.ts"]);
+      assert.equal(overlapping.scannedFileCount, 2);
     });
   });
 

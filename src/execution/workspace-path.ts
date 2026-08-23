@@ -18,6 +18,7 @@ export type WorkspaceErrorCode =
   | "WORKSPACE_ESCAPE"
   | "WORKSPACE_SYMLINK_DISALLOWED"
   | "WORKSPACE_PROTECTED_PATH"
+  | "WORKSPACE_FILESYSTEM_ERROR"
   | "WORKSPACE_LIMIT_EXCEEDED"
   | "WORKSPACE_BINARY_FILE"
   | "WORKSPACE_INVALID_PATCH"
@@ -62,6 +63,12 @@ export class WorkspaceSymlinkError extends WorkspaceError {
 export class WorkspaceProtectedPathError extends WorkspaceError {
   public constructor() {
     super("WORKSPACE_PROTECTED_PATH", "The requested path is protected by the Workspace policy");
+  }
+}
+
+export class WorkspaceFilesystemError extends WorkspaceError {
+  public constructor() {
+    super("WORKSPACE_FILESYSTEM_ERROR", "A Repository filesystem operation failed");
   }
 }
 
@@ -122,9 +129,27 @@ export function normalizeWorkspacePath(
   return parsed.data;
 }
 
-/** `.git` is a reserved v0.3 Repository path independent of ResourceScope. */
+type ProtectedPathRule = (segments: readonly string[]) => boolean;
+
+/**
+ * Runtime-owned v0.3 protected-path policy. New internal Repository paths can
+ * be added here without changing individual Workspace operations.
+ */
+const WORKSPACE_PROTECTED_PATH_RULES: readonly ProtectedPathRule[] = [
+  (segments) => segments[0] === ".git",
+  (segments) => segments.some((segment) => segment.startsWith(".env")),
+  (segments) => segments.some((segment) => segment.endsWith(".pem")),
+  (segments) => segments.some((segment) => segment.endsWith(".key")),
+];
+
+export function isWorkspacePathProtected(relativePath: string): boolean {
+  const segments = relativePath.split("/");
+  return WORKSPACE_PROTECTED_PATH_RULES.some((rule) => rule(segments));
+}
+
+/** Protected paths are reserved independently of ResourceScope breadth. */
 export function assertWorkspacePathIsNotProtected(relativePath: string): void {
-  if (relativePath === ".git" || relativePath.startsWith(".git/")) {
+  if (isWorkspacePathProtected(relativePath)) {
     throw new WorkspaceProtectedPathError();
   }
 }
