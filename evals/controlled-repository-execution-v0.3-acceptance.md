@@ -18,7 +18,7 @@
 | Test ID | 予定ファイル | 主対象 |
 | --- | --- | --- |
 | UT-WS | `tests/tools/workspace-path-resolver.test.ts` | AC-03, AC-06 |
-| UT-TR | `tests/unit/tool-contracts.test.ts` | AC-04, AC-05 |
+| UT-TR | `tests/unit/tool-contracts.test.ts`（実装済み） | AC-04、AC-05 の domain contract 部分 |
 | UT-TB | `tests/tools/tool-broker.test.ts` | AC-08, AC-10, AC-12 |
 | UT-WL | `tests/unit/worker-tool-loop.test.ts` | AC-15, AC-19 |
 | IT-AUDIT | `tests/integration/tool-evidence-persistence.test.ts` | AC-07, AC-13, AC-14 |
@@ -204,4 +204,6 @@ git diff --check
 
 ## 6. 現在の証拠境界
 
-この文書作成時点ではv0.3 product codeとScenario A–Jは未実装である。本書のcheckboxや予定test pathは将来のacceptance contractであり、現在のPASSを主張しない。v0.2の既存check結果はv0.3 completionの代用にならない。
+Issue #3 の domain contract 部分は実装済みである。`UT-TR`は strict ToolRequest proposal / Runtime-bound request、5つの built-in tool と決定論的 action mapping、path/patch input の拒否、authorization bundle、success / failed / timed_out Evidence、JSON hydrate を確認する。
+
+ただし、これは v0.3 product code 全体のPASSを意味しない。Workspace resolver、ToolBroker、SQLite append-only persistence、Worker tool loop、Scenario A–J は後続Issueの範囲であり、未実装である。v0.2またはこの domain contract のcheck結果は、それらRuntime enforcementの代用にならない。
