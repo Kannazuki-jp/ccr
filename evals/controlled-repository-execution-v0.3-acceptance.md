@@ -17,7 +17,7 @@
 
 | Test ID | 予定ファイル | 主対象 |
 | --- | --- | --- |
-| UT-WS | `tests/tools/workspace-path-resolver.test.ts` | AC-03, AC-06 |
+| UT-WS | `tests/unit/workspace.test.ts`、`tests/integration/workspace-boundary.test.ts`（実装済み） | AC-03、AC-06 の Workspace 側 |
 | UT-TR | `tests/unit/tool-contracts.test.ts`（実装済み） | AC-04、AC-05 の domain contract 部分 |
 | UT-TB | `tests/tools/tool-broker.test.ts` | AC-08, AC-10, AC-12 |
 | UT-WL | `tests/unit/worker-tool-loop.test.ts` | AC-15, AC-19 |
@@ -206,4 +206,12 @@ git diff --check
 
 Issue #3 の domain contract 部分は実装済みである。`UT-TR`は strict ToolRequest proposal / Runtime-bound request、5つの built-in tool と決定論的 action mapping、NUL を含む非canonical path と patch input の拒否、selection Authorization と operation Authorization/resource の一対一対応を持つ authorization bundle、`repo.read` content を含む success Evidence、partial observation を許す failed / timed_out Evidence、JSON hydrate を確認する。
 
-ただし、これは v0.3 product code 全体のPASSを意味しない。Workspace resolver、ToolBroker、SQLite append-only persistence、Worker tool loop、Scenario A–J は後続Issueの範囲であり、未実装である。v0.2またはこの domain contract のcheck結果は、それらRuntime enforcementの代用にならない。
+Issue #4 の Workspace 境界は実装済みである。`UT-WS`は実temporary filesystemで、canonical root、absolute/traversal/mixed-separator/NUL拒否、sibling-prefix型の外部symlink escape、create parent escape、`.git/**`と`.env*` / `*.pem` / `*.key`の保護、保守的な「symlinkをdereferenceしない」方針、list/read/searchの順序・byte/size/result/file-count limit、重複rootのunique file計数、UTF-8 text判定、filesystem failureのtypedかつabsolute-path非漏えい変換、single-target complete-replacement patchのhash precondition、およびpath ResourceScopeのexact/subtree/sibling-prefix matchingを確認する。これは AC-03、AC-06、AC-10、AC-11 の Workspace 側証拠であり、Scenario D のWorkspace resolver部分では `WORKSPACE_ESCAPE` を返して外部内容を読まず、副作用を起こさない。
+
+### Issue #4 Workspace verification snapshot（2026-08-23）
+
+- `corepack pnpm run check`: PASS（132 tests、line 94.67%、branch 86.72%、function 94.33%）
+- `corepack pnpm run ci:smoke`: PASS（happy / escalation の built CLI + SQLite確認）
+- `git diff --check`: PASS
+
+ただし、これは v0.3 product code 全体のPASSを意味しない。ToolBroker、Doctrine authorizationとの接続、ToolRequest/ToolEvidenceのSQLite append-only persistence、Worker tool loop、`test.run`、および Scenario A–J のend-to-end実行は後続Issueの範囲であり、未実装である。Workspace単体のcheck結果は、それらRuntime enforcementの代用にならない。
